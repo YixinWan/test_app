@@ -4,10 +4,9 @@ import json
 import os
 from scipy.optimize import minimize
 import itertools
-import numpy as np
 import cv2
-from skimage.segmentation import slic, mark_boundaries
-from skimage.color import label2rgb, rgb2gray
+from skimage.segmentation import slic, find_boundaries
+from skimage.color import rgb2gray
 from skimage.filters import sobel, gaussian
 from skimage.morphology import dilation, square
 
@@ -37,9 +36,18 @@ def cmy_to_rgb(cmy):
     return np.clip((1 - cmy) * 255, 0, 255).astype(int)
 
 def smooth_image(img):
+    """
+    对图像进行平滑处理，使用均值漂移滤波。
+    
+    输入:
+      - img: 输入图像，numpy 数组 (H, W, 3)，RGB 格式，uint8 类型
+    
+    输出:
+      - 平滑后的图像，numpy 数组，与输入相同的形状和类型
+    """
     return cv2.pyrMeanShiftFiltering(img, 10, 20)
 
-    
+
 # -------------------------计算混色建议函数------------------------------------------
 def suggest_mix(target_rgb, palette_source, paint_colors=None, max_candidates=6):
     """
@@ -320,5 +328,176 @@ def slic_color_blocks(image: np.ndarray, target_segments: int,
 
     return labels, palette
 
+#-----------------------粗分色块函数-------------------------------------------
+def coarse_color_blocks(
+    image: np.ndarray,
+    *,
+    slic_segments: int = 5000,
+    color_merge_thresh: float = 30.0,
+    force_merge_thresh: float = 0.01,
+    absorb_area_thresh: int = 800,
+) -> tuple:
+    """
+    生成“粗分色块（铺色指导图）”：结构线约束 + 颜色相似 + 小面积合并。
 
+    输入参数（核心可迁移）：
+    - image: 原图 (H,W,3) RGB uint8
+    - slic_segments: 初始 SLIC 超像素数（越大越细）
+    - color_merge_thresh: 区域颜色合并阈值（越小越保守）
+    - force_merge_thresh: 无结构线处强制合并阈值（线强 < 此值直接合并）
+    - absorb_area_thresh: 小区域面积阈值（像素），小于此阈值尝试被吸收
+
+    输出：
+    - labels: (H,W) int 连续标签，从 1 开始
+    - palette: dict[label] -> (r,g,b) uint8
+    """
+
+    # 内部推荐默认（无需在函数签名暴露）
+    slic_compactness = 12.0
+    edge_sigma = 1.0
+    edge_merge_thresh = 0.25
+    absorb_color_thresh = 70.0
+    absorb_edge_protect_thresh = 0.3
+
+    # 预处理与结构线
+    smooth = smooth_image(image)
+    # 调整结构线平滑强度（默认 1.0，与 extract_structure_lines 一致）
+    gray = rgb2gray(smooth)
+    grad = sobel(gray)
+    grad = gaussian(grad, sigma=float(edge_sigma))
+    grad = dilation(grad, square(2))
+    edge_strength = np.clip(grad / max(grad.max(), 1e-8), 0, 1)
+
+    # 初始 SLIC 分割
+    segments = slic(
+        smooth,
+        n_segments=int(max(1, slic_segments)),
+        compactness=float(slic_compactness),
+        start_label=1
+    )
+
+    # Union-Find 初始化（按区域均值颜色）
+    h, w = segments.shape
+    parent = {}
+    region_color = {}
+    uniq = np.unique(segments)
+    for lab in uniq:
+        parent[int(lab)] = int(lab)
+        mask = segments == lab
+        region_color[int(lab)] = np.mean(image[mask], axis=0)
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    # 结构线约束 + 颜色合并
+    for y in range(h - 1):
+        for x in range(w - 1):
+            a = int(segments[y, x])
+            b = int(segments[y, x + 1])
+            c = int(segments[y + 1, x])
+            for u, v in ((a, b), (a, c)):
+                if u == v:
+                    continue
+                cu = region_color[find(u)]
+                cv = region_color[find(v)]
+                color_dist = float(np.linalg.norm(cu - cv))
+                edge_val = float(edge_strength[y, x])
+                if edge_val < float(force_merge_thresh):
+                    union(u, v)
+                    continue
+                if color_dist < float(color_merge_thresh) and edge_val < float(edge_merge_thresh):
+                    union(u, v)
+
+    # 构建合并后的标签
+    merged = np.zeros_like(segments)
+    label_map = {}
+    new_label = 1
+    for y in range(h):
+        for x in range(w):
+            root = find(int(segments[y, x]))
+            if root not in label_map:
+                label_map[root] = new_label
+                new_label += 1
+            merged[y, x] = label_map[root]
+
+    # 小面积吸收式进一步合并
+    labels = merged.copy()
+
+    # 预计算属性
+    props = {}
+    uniq2 = np.unique(labels)
+    for lab in uniq2:
+        if lab == 0:
+            continue
+        mask = labels == lab
+        props[int(lab)] = {
+            "area": int(mask.sum()),
+            "mean_color": np.mean(image[mask], axis=0),
+            "mask": mask,
+        }
+
+    def find_neighbors(label):
+        mask = labels == label
+        dilated = dilation(mask, square(3))
+        neighbor_labels = np.unique(labels[dilated])
+        return [int(l) for l in neighbor_labels if int(l) != int(label) and int(l) != 0]
+
+    def edge_between(mask_a, mask_b):
+        boundary = find_boundaries(mask_a, mode="outer") & mask_b
+        if boundary.sum() == 0:
+            return 0.0
+        return float(np.mean(edge_strength[boundary]))
+
+    for lab, p in props.items():
+        if p["area"] >= int(absorb_area_thresh):
+            continue
+        neighbors = find_neighbors(lab)
+        if not neighbors:
+            continue
+        best_target = None
+        best_score = np.inf
+        for nb in neighbors:
+            np_ = props.get(nb)
+            if np_ is None:
+                continue
+            if np_["area"] <= p["area"]:
+                continue
+            eval = edge_between(p["mask"], np_["mask"])
+            if eval > float(absorb_edge_protect_thresh):
+                continue
+            cdist = float(np.linalg.norm(p["mean_color"] - np_["mean_color"]))
+            if cdist > float(absorb_color_thresh):
+                continue
+            score = cdist - 1e-4 * np_["area"]
+            if score < best_score:
+                best_score = score
+                best_target = nb
+        if best_target is not None:
+            labels[p["mask"]] = best_target
+
+    # 重排标签为连续 [1..K]
+    uniq3 = np.unique(labels)
+    uniq3 = [int(l) for l in uniq3 if int(l) != 0]
+    remap = {lab: i + 1 for i, lab in enumerate(sorted(uniq3))}
+    final_labels = np.zeros_like(labels)
+    for lab, new_lab in remap.items():
+        final_labels[labels == lab] = new_lab
+
+    # palette 计算（用原图均值颜色）
+    palette = {}
+    for lab in sorted(remap.values()):
+        mask = final_labels == lab
+        mean_color = np.mean(image[mask], axis=0)
+        rgb = tuple(int(np.clip(round(c), 0, 255)) for c in mean_color)
+        palette[int(lab)] = rgb
+
+    return final_labels, palette
 
