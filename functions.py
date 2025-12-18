@@ -4,6 +4,12 @@ import json
 import os
 from scipy.optimize import minimize
 import itertools
+import numpy as np
+import cv2
+from skimage.segmentation import slic, mark_boundaries
+from skimage.color import label2rgb, rgb2gray
+from skimage.filters import sobel, gaussian
+from skimage.morphology import dilation, square
 
 # -------------------------辅助函数------------------------------------------
 def rgb_to_cmy(rgb):
@@ -30,6 +36,10 @@ def cmy_to_rgb(cmy):
     """
     return np.clip((1 - cmy) * 255, 0, 255).astype(int)
 
+def smooth_image(img):
+    return cv2.pyrMeanShiftFiltering(img, 10, 20)
+
+    
 # -------------------------计算混色建议函数------------------------------------------
 def suggest_mix(target_rgb, palette_source, paint_colors=None, max_candidates=6):
     """
@@ -269,3 +279,46 @@ def generate_steps_from_mix(top_colors, weights, max_total=15):
             })
 
     return steps
+
+#-----------------------细分色块函数（SLIC）-------------------------------------------
+def slic_color_blocks(image: np.ndarray, target_segments: int,
+                      *, compactness: float = 8.0, sigma: float = 0.8) -> tuple:
+    """
+    用 SLIC 进行“按颜色为主”的超像素分割（封装函数，便于复用）。
+
+    输入
+    - image: 原图 (H,W,3) RGB, uint8 [0,255]
+    - target_segments: 目标色块数量（“粗细”控制：值越大越细，块越多越小）
+    - compactness: 形状紧凑度（越大形状更规整，默认 8.0，偏向颜色主导）
+    - sigma: 分割前的高斯平滑（去噪，默认 0.8）
+
+    输出 (labels, palette)
+    - labels: (H,W) int，从 1 开始的色块 ID（0 保留为背景未用）
+    - palette: dict[int, (r,g,b)]，每个 label 对应原图中的均值 RGB（uint8），用于前端重建均色图与点击取色
+
+    """
+    # 适度保边缘平滑，减少纹理噪点，但不破坏大边界
+    sm = smooth_image(image)
+
+    # 执行 SLIC，颜色主导 + 空间约束（start_label=1 方便下游）
+    labels = slic(
+        sm, n_segments=int(max(1, target_segments)), compactness=float(compactness),
+        sigma=float(sigma), start_label=1
+    )
+
+    # 计算每个 label 的原图均值颜色 -> palette
+    palette = {}
+    uniq = np.unique(labels)
+    for lab in uniq:
+        if lab == 0:
+            continue
+        mask = labels == lab
+        mean_color = np.mean(image[mask], axis=0)
+        # 转为 uint8 三元组
+        rgb = tuple(int(np.clip(round(c), 0, 255)) for c in mean_color)
+        palette[int(lab)] = rgb
+
+    return labels, palette
+
+
+
