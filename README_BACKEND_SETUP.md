@@ -4,11 +4,10 @@
 
 ## 1. 代码结构
 
-- `functions.py`
-  - 颜色空间转换：`rgb_to_cmy` / `cmy_to_rgb`
-  - 调色建议：`suggest_mix`
-  - 分步调色步骤生成：`generate_steps_from_mix`
-  - 图像分割相关：`slic_color_blocks`、`coarse_color_blocks`（当前 HTTP 接口暂未直接使用，可后续扩展为区域级分析）
+- `domain/`
+  - `color_mixing.py`：颜色空间转换、调色建议算法
+  - `segmentation.py`：图像分割算法（SLIC、区域合并）
+  - `line_art.py`：线稿生成算法
 - `app.py`
   - FastAPI 后端入口，提供以下核心接口：
     - `POST /api/painting/register-original`：登记原图，返回 `imageId`
@@ -23,13 +22,39 @@
 
 建议使用 Python 3.9+。
 
-安装依赖（示例）：
+### 2.1 快速安装
+
+#### 方式一：使用 pip（推荐轻量级部署）
+
+项目根目录下已提供 `requirements.txt`，可直接运行：
+
+```powershell
+pip install -r requirements.txt
+```
+
+#### 方式二：使用 Conda（推荐开发环境）
+
+如果你使用 Anaconda 或 Miniconda，可以使用 `environment.yml` 创建独立的虚拟环境，避免依赖冲突：
+
+```powershell
+# 1. 创建环境
+conda env create -f environment.yml
+
+# 2. 激活环境
+conda activate painting-helper
+```
+
+### 2.2 手动安装（可选）
+
+若需手动控制依赖版本，可参考：
 
 ```powershell
 pip install fastapi uvicorn[standard] opencv-python-headless numpy scikit-image scipy
 ```
 
-> 若本机无 GUI，推荐使用 `opencv-python-headless`；若已有完整 OpenCV，可改为 `opencv-python`。
+> **注意**：
+> - 若本机无 GUI（如服务器环境），推荐使用 `opencv-python-headless`（默认配置）。
+> - 若在本地开发且需要 `cv2.imshow` 等窗口功能，可将 `requirements.txt` 中的 `opencv-python-headless` 改为 `opencv-python`。
 
 ## 3. 运行后端服务
 

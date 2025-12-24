@@ -10,9 +10,10 @@ import cv2
 import numpy as np
 import shutil
 import pickle
+from skimage.segmentation import find_boundaries
 
 from domain import suggest_mix, generate_steps_from_mix
-from domain.segmentation import coarse_color_blocks
+from domain.segmentation import coarse_color_blocks, slic_color_blocks
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ORIGINAL_DIR = os.path.join(BASE_DIR, "static", "originals")
@@ -113,8 +114,8 @@ async def upload_original_file(file: UploadFile = File(...)):
     # 使用较少的 segments 和较大的 absorb_area_thresh
     labels_large, palette_large = coarse_color_blocks(
         img_rgb,
-        slic_segments=50,       # 分割数少
-        absorb_area_thresh=10  # 小区域合并阈值大
+        slic_segments=70,       # 分割数少
+        force_merge_thresh=0.01  # 结构线约束
     )
     img_large = _reconstruct_image_from_labels(labels_large, palette_large)
     
@@ -131,11 +132,10 @@ async def upload_original_file(file: UploadFile = File(...)):
         pickle.dump({"labels": labels_large, "palette": palette_large}, f)
 
     # 2. 生成小色块图 (Fine / Small Segments)
-    # 使用较多的 segments 和较小的 absorb_area_thresh
-    labels_small, palette_small = coarse_color_blocks(
+    # 使用 slic_color_blocks 生成较多细节的超像素
+    labels_small, palette_small = slic_color_blocks(
         img_rgb,
-        slic_segments=3000,      # 分割数多
-        absorb_area_thresh=500   # 小区域合并阈值小
+        target_segments=500
     )
     img_small = _reconstruct_image_from_labels(labels_small, palette_small)
 
@@ -217,13 +217,39 @@ def _get_pixel_rgb(image: np.ndarray, x: int, y: int) -> np.ndarray:
     return image[y, x, :]
 
 
-def _create_masked_image(image: np.ndarray, x: int, y: int, radius: int = 10) -> np.ndarray:
-    """生成只有点击区域保留颜色、其他区域置为黑色的图。"""
+def _apply_segmentation_boundaries(image: np.ndarray, labels: np.ndarray, color: Tuple[int, int, int] = (128, 128, 128)):
+    """在图像上叠加分割线（灰色虚线效果）。"""
+    # 找出边界 (boolean mask)
+    boundaries = find_boundaries(labels, mode='thick')
+    
+    # 生成虚线掩码：利用坐标奇偶性模拟
+    # 这里使用 (x + y) % 4 < 2 来生成类似虚线的效果
+    h, w = labels.shape
+    y_grid, x_grid = np.indices((h, w))
+    dashed_mask = ((x_grid + y_grid) % 4 < 2)
+    
+    # 最终掩码：是边界 且 符合虚线规则
+    final_mask = boundaries & dashed_mask
+    
+    # 应用颜色
+    image[final_mask] = color
+    return image
+
+
+def _create_masked_image(image: np.ndarray, x: int, y: int, radius: int = 10, labels: Optional[np.ndarray] = None) -> np.ndarray:
+    """生成只有点击区域保留颜色、其他区域置为黑色的图。
+    
+    如果提供了 labels，则会叠加灰色虚线分割线。
+    """
     h, w, _ = image.shape
     mask = np.zeros((h, w), dtype=np.uint8)
     cv2.circle(mask, (int(x), int(y)), int(radius), 255, -1)
     masked = np.zeros_like(image)
     masked[mask == 255] = image[mask == 255]
+    
+    if labels is not None:
+        _apply_segmentation_boundaries(masked, labels)
+        
     return masked
 
 
@@ -445,6 +471,9 @@ async def color_mix_from_click_by_id(req: ColorMixFromClickByIdRequest):
                 masked_image = np.zeros((h, w, 3), dtype=np.uint8)
                 mask = (labels == label_id)
                 masked_image[mask] = target_rgb
+                
+                # 叠加分割线
+                _apply_segmentation_boundaries(masked_image, labels)
 
             except Exception as e:
                 if isinstance(e, HTTPException):
@@ -560,6 +589,9 @@ async def color_mix_from_click_by_url(req: ColorMixFromClickByUrlRequest):
             masked_image = np.zeros((h, w, 3), dtype=np.uint8)
             mask = (labels == label_id)
             masked_image[mask] = target_rgb
+            
+            # 叠加分割线
+            _apply_segmentation_boundaries(masked_image, labels)
 
         except Exception as e:
             # 除非是上面主动抛出的 HTTPException，否则捕获并报 500

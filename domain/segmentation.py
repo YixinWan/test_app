@@ -47,10 +47,10 @@ def slic_color_blocks(image: np.ndarray, target_segments: int,
 def coarse_color_blocks(
     image: np.ndarray,
     *,
-    slic_segments: int = 5000,
-    color_merge_thresh: float = 30.0,
+    slic_segments: int = 70,
+    color_merge_thresh: float = 40.0,
     force_merge_thresh: float = 0.01,
-    absorb_area_thresh: int = 800,
+    absorb_area_thresh: int = 10000,
 ) -> tuple:
     """生成“粗分色块（铺色指导图）”：结构线约束 + 颜色相似 + 小面积合并。
 
