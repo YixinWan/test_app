@@ -24,7 +24,7 @@ SEGMENTED_DATA_DIR = os.path.join(BASE_DIR, "static", "segmented_data")
 # 后端对外访问的基础 URL，需要与你前端配置的 BACKEND_BASE_URL 保持一致
 # 示例：前端配置为 export const BACKEND_BASE_URL = 'http://172.16.25.51:8000'
 # 这里就写成相同的地址，便于返回完整的 projectorImageUrl
-BACKEND_BASE_URL = os.environ.get("BACKEND_BASE_URL", "http://172.16.25.165:8000")
+BACKEND_BASE_URL = os.environ.get("BACKEND_BASE_URL", "http://172.16.20.50:8000")
 
 os.makedirs(ORIGINAL_DIR, exist_ok=True)
 os.makedirs(PROCESSED_DIR, exist_ok=True)
