@@ -3,14 +3,15 @@ from typing import Dict, Tuple
 import numpy as np
 import cv2
 from skimage.segmentation import slic, find_boundaries
-from skimage.color import rgb2gray
-from skimage.filters import sobel, gaussian
 from skimage.morphology import dilation, square
+from .line_art import line_art
 
 
 def smooth_image(img: np.ndarray) -> np.ndarray:
     """对图像进行平滑处理，使用均值漂移滤波。"""
     return cv2.pyrMeanShiftFiltering(img, 10, 20)
+
+
 
 
 def slic_color_blocks(image: np.ndarray, target_segments: int,
@@ -66,11 +67,7 @@ def coarse_color_blocks(
     absorb_edge_protect_thresh = 0.3
 
     smooth = smooth_image(image)
-    gray = rgb2gray(smooth)
-    grad = sobel(gray)
-    grad = gaussian(grad, sigma=float(edge_sigma))
-    grad = dilation(grad, square(2))
-    edge_strength = np.clip(grad / max(grad.max(), 1e-8), 0, 1)
+    edge_strength = line_art(smooth, edge_sigma=float(edge_sigma), dilation_size=2)
 
     segments = slic(
         smooth,
