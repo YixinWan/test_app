@@ -158,10 +158,8 @@ async def upload_original_file(file: UploadFile = File(...)):
         pickle.dump({"labels": labels_small, "palette": palette_small}, f)
 
     # --- 生成线稿图 (Line Art) ---
-    # line_art returns edge strength [0, 1], where 1=edge(white), 0=flat(black)
-    # We want sketch style: black lines on white background
-    edge_strength = line_art(img_rgb)
-    line_art_img = ((1.0 - edge_strength) * 255).astype(np.uint8)
+    # 新的 line_art 返回素描风格灰度图（uint8，白底黑线），可直接保存
+    line_art_img = line_art(img_rgb)
     
     filename_lineart = f"{filename_base}_lineart.png"
     path_lineart = os.path.join(LINE_ART_DIR, filename_lineart)
@@ -491,13 +489,15 @@ async def color_mix_from_click_by_id(req: ColorMixFromClickByIdRequest):
                 target_rgb = np.array(palette[label_id])
                 
                 if req.layer == "segment_small":
-                    masked_image = np.zeros((h, w, 3), dtype=np.uint8)
+                    masked_image = np.zeros((h, w, 3), dtype=np.uint8)  # 生成黑色背景图
                 else:
+                    # masked_image = np.zeros((h, w, 3), dtype=np.uint8)
+                    # mask = (labels == label_id)
+                    # masked_image[mask] = target_rgb
+                    # # 叠加分割线
+                    # _apply_segmentation_boundaries(masked_image, labels)
+
                     masked_image = np.zeros((h, w, 3), dtype=np.uint8)
-                    mask = (labels == label_id)
-                    masked_image[mask] = target_rgb
-                    # 叠加分割线
-                    _apply_segmentation_boundaries(masked_image, labels)
 
             except Exception as e:
                 if isinstance(e, HTTPException):
@@ -572,8 +572,7 @@ async def generate_line_art(req: LineArtRequest):
             # 如果不存在（可能是旧图片），则现场生成一次
             # Fallback logic
             img, _ = _load_image_from_url_or_path(req.imageUrl)
-            edge_strength = line_art(img)
-            line_art_img = ((1.0 - edge_strength) * 255).astype(np.uint8)
+            line_art_img = line_art(img)
             cv2.imwrite(path_lineart, line_art_img)
             
         # 3. 返回 URL

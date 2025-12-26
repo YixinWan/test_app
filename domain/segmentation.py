@@ -67,7 +67,11 @@ def coarse_color_blocks(
     absorb_edge_protect_thresh = 0.3
 
     smooth = smooth_image(image)
-    edge_strength = line_art(smooth, edge_sigma=float(edge_sigma), dilation_size=2)
+    # 使用新的素描法生成的线稿（白底黑线，uint8），再转换为 [0,1] 的“边缘强度”(边缘=1)
+    # 将 edge_sigma 粗略映射为高斯核大小（21 对应 ~1.0 的柔和度）
+    est_k = max(3, int(round(edge_sigma * 10)) * 2 + 1)
+    sketch = line_art(smooth, k_size=est_k)
+    edge_strength = 1.0 - (sketch.astype(np.float32) / 255.0)
 
     segments = slic(
         smooth,

@@ -1,61 +1,70 @@
-from typing import Any
-
 import numpy as np
-from skimage.color import rgb2gray
-from skimage.filters import sobel, gaussian
-from skimage.morphology import dilation, footprint_rectangle
+import cv2
 
 
-def line_art(
-    image: np.ndarray,
-    *,
-    edge_sigma: float = 0.2,
-    dilation_size: int = 2,
-) -> np.ndarray:
-    """将彩色图像生成线稿强度图（0-1）。
+def line_art(image: np.ndarray, k_size: int = 41) -> np.ndarray:
+    """根据“灰度化 -> 反相 -> 高斯模糊 -> 颜色减淡（Color Dodge） -> 对比度拉升”生成素描风格线稿。
 
-    处理步骤：
-    1) 转灰度 rgb2gray
-    2) Sobel 梯度
-    3) 高斯平滑（sigma=edge_sigma）
-    4) 形态学膨胀（footprint_rectangle((dilation_size, dilation_size))）
-    5) 归一化到 [0,1]
+    输入:
+    - image: HxW 或 HxWx3 图像。
+        • 若为 uint8，取值应为 [0,255]
+        • 若为 float/其他类型，会先裁剪到 [0,1] 再映射到 uint8
 
     参数:
-    - image: HxWx3 RGB 图像 (uint8/float 均可)
-    - edge_sigma: 高斯平滑的 sigma
-    - dilation_size: 膨胀核大小（square(size)）
+    - k_size: 高斯模糊核大小（建议使用奇数，>=3）。会自动纠正为 >=3 的奇数。
 
     返回:
-    - edge_strength: HxW 浮点数组，范围 [0,1]
+    - sketch_raw: HxW uint8 灰度图，白底黑线（适合直接保存/展示），并做了适度对比度拉升让黑更黑、白更白。
     """
-    gray = rgb2gray(image)
-    grad = sobel(gray)
-    
-    # 1. 适度平滑，压制高频噪点（保守一些，避免抹掉细轮廓）
-    grad = gaussian(grad, sigma=float(edge_sigma))
-    
-    # 2. 归一化
-    grad = grad / max(float(grad.max()), 1e-8)
-    
-    # 3. 软阈值抬升：去掉弱噪点，同时保留细线
-    noise_thresh = 0.07
-    grad = np.clip((grad - noise_thresh) / (1.0 - noise_thresh), 0, 1)
-    
-    # 4. 轻度对比增强：让线条更黑但不过度压暗
-    contrast_gain = 2.4
-    grad = np.clip(grad * contrast_gain, 0, 1)
+    # 1) 灰度化（确保输入为 uint8）
+    if image.dtype != np.uint8:
+        img_u8 = (np.clip(image, 0, 1) * 255).astype(np.uint8)
+    else:
+        img_u8 = image
 
-    # 5. 先轻度膨胀，再做一次加权抬升以连粗主线
-    grad = dilation(grad, footprint_rectangle((int(dilation_size), int(dilation_size))))
+    if img_u8.ndim == 3 and img_u8.shape[2] == 3:
+        # 约定外部传入为 RGB
+        gray = cv2.cvtColor(img_u8, cv2.COLOR_RGB2GRAY)
+    elif img_u8.ndim == 2:
+        gray = img_u8
+    else:
+        raise ValueError("image must be HxW or HxWx3")
 
-    # 6. 对膨胀后的结果再做一次平滑抬升，压低孤立小块
-    #    连续区域被膨胀后数值更高，乘以 gain 后更黑；孤立噪点因面积小被扩散稀释，变得更淡
-    contrast_gain_2 = 1.4
-    grad = np.clip(grad * contrast_gain_2, 0, 1)
-    
-    # 7. 最终取反：黑白反转（让原本黑线变白，白底变黑，或反之）
-    return grad
+    # 2) 反相
+    inv_gray = 255 - gray
+
+    # 3) 高斯模糊（核大小转为 >=3 的奇数）
+    k = int(k_size)
+    if k < 3:
+        k = 3
+    if k % 2 == 0:
+        k += 1
+    blurred = cv2.GaussianBlur(inv_gray, (k, k), 0)
+
+    # 4) 颜色减淡（Color Dodge）
+    # 使用 denom = 255 - blurred，OpenCV 的 divide 会做饱和处理
+    denom = cv2.subtract(np.full_like(blurred, 255), blurred)
+    sketch_raw = cv2.divide(gray, denom, scale=256)
+
+    # 5) 对比度拉升（百分位线性拉伸）：让黑更黑、白更白
+    # 说明：对直方图的低/高百分位进行裁剪并线性拉伸到 [0,255]
+    def _boost_contrast_u8(img_u8: np.ndarray, black_clip: float = 2.0, white_clip: float = 98.0) -> np.ndarray:
+        if img_u8.dtype != np.uint8:
+            raise ValueError("_boost_contrast_u8 expects uint8 image")
+        # 计算低/高百分位阈值
+        p_low = float(np.percentile(img_u8, black_clip))
+        p_high = float(np.percentile(img_u8, white_clip))
+        if p_high <= p_low:
+            # 极端情况，返回原图
+            return img_u8
+        img_f = img_u8.astype(np.float32)
+        img_f = np.clip(img_f, p_low, p_high)
+        img_f = (img_f - p_low) / (p_high - p_low) * 255.0
+        return img_f.astype(np.uint8)
+
+    sketch_raw = _boost_contrast_u8(sketch_raw, black_clip=2.0, white_clip=98.0)
+
+    return sketch_raw
 
 
 __all__ = ["line_art"]
