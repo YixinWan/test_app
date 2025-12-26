@@ -14,12 +14,14 @@ from skimage.segmentation import find_boundaries
 
 from domain import suggest_mix, generate_steps_from_mix
 from domain.segmentation import coarse_color_blocks, slic_color_blocks
+from domain.line_art import line_art
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ORIGINAL_DIR = os.path.join(BASE_DIR, "static", "originals")
 PROCESSED_DIR = os.path.join(BASE_DIR, "static", "processed")
 SEGMENTED_DIR = os.path.join(BASE_DIR, "static", "segmented")
 SEGMENTED_DATA_DIR = os.path.join(BASE_DIR, "static", "segmented_data")
+LINE_ART_DIR = os.path.join(BASE_DIR, "static", "line_art")
 
 # 后端对外访问的基础 URL，需要与你前端配置的 BACKEND_BASE_URL 保持一致
 # 示例：前端配置为 export const BACKEND_BASE_URL = 'http://172.16.25.51:8000'
@@ -30,6 +32,7 @@ os.makedirs(ORIGINAL_DIR, exist_ok=True)
 os.makedirs(PROCESSED_DIR, exist_ok=True)
 os.makedirs(SEGMENTED_DIR, exist_ok=True)
 os.makedirs(SEGMENTED_DATA_DIR, exist_ok=True)
+os.makedirs(LINE_ART_DIR, exist_ok=True)
 
 app = FastAPI(title="Painting Helper Backend")
 
@@ -73,6 +76,11 @@ class ColorMixFromClickByUrlRequest(BaseModel):
     imageUrl: str
     pixel: PixelCoord
     layer: Optional[str] = None  # "original", "segment_large", "segment_small"
+
+
+class LineArtRequest(BaseModel):
+    imageUrl: str
+    mode: Optional[str] = "sketch"
 
 
 
@@ -149,13 +157,25 @@ async def upload_original_file(file: UploadFile = File(...)):
     with open(data_small_path, "wb") as f:
         pickle.dump({"labels": labels_small, "palette": palette_small}, f)
 
+    # --- 生成线稿图 (Line Art) ---
+    # line_art returns edge strength [0, 1], where 1=edge(white), 0=flat(black)
+    # We want sketch style: black lines on white background
+    edge_strength = line_art(img_rgb)
+    line_art_img = ((1.0 - edge_strength) * 255).astype(np.uint8)
+    
+    filename_lineart = f"{filename_base}_lineart.png"
+    path_lineart = os.path.join(LINE_ART_DIR, filename_lineart)
+    cv2.imwrite(path_lineart, line_art_img)
+
     # --- 清理旧数据 ---
     # 只保留本次生成的4个文件：
     # 1. SEGMENTED_DIR: filename_large, filename_small
     # 2. SEGMENTED_DATA_DIR: filename_base_large.pkl, filename_base_small.pkl
+    # 3. LINE_ART_DIR: filename_lineart
     
     _clear_directory_except(SEGMENTED_DIR, [filename_large, filename_small])
     _clear_directory_except(SEGMENTED_DATA_DIR, [os.path.basename(data_large_path), os.path.basename(data_small_path)])
+    _clear_directory_except(LINE_ART_DIR, [filename_lineart])
 
     return {
         "code": 0,
@@ -432,6 +452,7 @@ async def color_mix_from_click_by_id(req: ColorMixFromClickByIdRequest):
     # 默认情况：从原图取色，生成圆形遮罩
     target_rgb = None
     masked_image = None
+    projector_url = None
     
     # 尝试解析原图文件名，以便寻找对应的分割数据
     # info["imageUrl"] 类似 "static/originals/origin_xxx.png"
@@ -468,12 +489,15 @@ async def color_mix_from_click_by_id(req: ColorMixFromClickByIdRequest):
                      raise HTTPException(status_code=400, detail={"code": 1006, "message": "clicked on invalid segment (background)", "data": None})
 
                 target_rgb = np.array(palette[label_id])
-                masked_image = np.zeros((h, w, 3), dtype=np.uint8)
-                mask = (labels == label_id)
-                masked_image[mask] = target_rgb
                 
-                # 叠加分割线
-                _apply_segmentation_boundaries(masked_image, labels)
+                if req.layer == "segment_small":
+                    masked_image = np.zeros((h, w, 3), dtype=np.uint8)
+                else:
+                    masked_image = np.zeros((h, w, 3), dtype=np.uint8)
+                    mask = (labels == label_id)
+                    masked_image[mask] = target_rgb
+                    # 叠加分割线
+                    _apply_segmentation_boundaries(masked_image, labels)
 
             except Exception as e:
                 if isinstance(e, HTTPException):
@@ -486,7 +510,7 @@ async def color_mix_from_click_by_id(req: ColorMixFromClickByIdRequest):
         # --- 原图模式 (默认) ---
         pass
 
-    if masked_image is None:
+    if masked_image is None and projector_url is None:
         # Fallback logic: load original image and create circle mask
         try:
             img, image_path = _load_image_from_url_or_path(info["imageUrl"])
@@ -498,15 +522,17 @@ async def color_mix_from_click_by_id(req: ColorMixFromClickByIdRequest):
         except IndexError:
             raise HTTPException(status_code=400, detail={"code": 1002, "message": "pixel out of range", "data": None})
         
-        masked_image = _create_masked_image(img, req.pixel.x, req.pixel.y, radius=10)
+        # 原图模式下，不再生成掩膜图，直接返回原图 URL
+        projector_url = _build_public_url_from_static_path(info["imageUrl"])
 
     # 2. 计算调色配方
     target_hex, mix_plan, steps = _build_mix_plan(target_rgb)
     if mix_plan is None:
         raise HTTPException(status_code=500, detail={"code": 2001, "message": "mix plan failed", "data": None})
 
-    # 3. 保存掩膜图并返回
-    projector_url = _save_processed_image(masked_image, req.imageId, req.pixel.x, req.pixel.y)
+    # 3. 保存掩膜图并返回 (如果 projector_url 还没定下来，说明是分割模式生成的 masked_image)
+    if projector_url is None:
+        projector_url = _save_processed_image(masked_image, req.imageId, req.pixel.x, req.pixel.y)
 
     return {
         "code": 0,
@@ -523,118 +549,46 @@ async def color_mix_from_click_by_id(req: ColorMixFromClickByIdRequest):
     }
 
 
-@app.post("/api/color-mix/from-click-by-url")
-async def color_mix_from_click_by_url(req: ColorMixFromClickByUrlRequest):
-    # 1. 尝试加载图片
+@app.post("/api/painting/line-art")
+async def generate_line_art(req: LineArtRequest):
     try:
-        img, image_path = _load_image_from_url_or_path(req.imageUrl)
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail={"code": 1001, "message": "image not found", "data": None})
-
-    # 2. 确定 layer 和 filename_base
-    # 尝试从 URL/Path 中推断 layer
-    # 假设 segmented url 格式: .../origin_xxx_large.png 或 .../origin_xxx_small.png
-    filename = os.path.basename(image_path)
-    name_no_ext = os.path.splitext(filename)[0]
-    
-    # Normalize filename_base by stripping known suffixes
-    if name_no_ext.endswith("_large"):
-        real_base = name_no_ext[:-6]
-        inferred_layer = "segment_large"
-    elif name_no_ext.endswith("_small"):
-        real_base = name_no_ext[:-6]
-        inferred_layer = "segment_small"
-    else:
-        real_base = name_no_ext
-        inferred_layer = "original"
-
-    # Use requested layer if present, otherwise inferred
-    layer = req.layer if req.layer else inferred_layer
-    filename_base = real_base
-
-    target_rgb = None
-    masked_image = None
-
-    if layer == "segment_large" or layer == "segment_small":
-        # --- 分割模式 ---
-        suffix = "large" if layer == "segment_large" else "small"
-        pkl_path = os.path.join(SEGMENTED_DATA_DIR, f"{filename_base}_{suffix}.pkl")
+        # 1. 尝试从 imageUrl 中解析出 filename_base
+        # imageUrl 可能是 "static/originals/origin_xxx.png"
+        # 我们需要找到对应的 "origin_xxx_lineart.png"
         
-        if not os.path.exists(pkl_path):
-            # 既然明确识别出了是分割图模式，如果数据不存在，应该报错而不是回退
-            raise HTTPException(status_code=404, detail={"code": 1004, "message": f"segmentation data pkl not found: {pkl_path}", "data": None})
-
-        try:
-            with open(pkl_path, "rb") as f:
-                seg_data = pickle.load(f)
-            labels = seg_data["labels"]
-            palette = seg_data["palette"]
+        # 如果是完整 URL，先转相对路径
+        if req.imageUrl.startswith("http://") or req.imageUrl.startswith("https://"):
+             # 简单处理：取最后的文件名
+             original_filename = os.path.basename(req.imageUrl)
+        else:
+             original_filename = os.path.basename(req.imageUrl)
+             
+        filename_base = os.path.splitext(original_filename)[0]
+        filename_lineart = f"{filename_base}_lineart.png"
+        path_lineart = os.path.join(LINE_ART_DIR, filename_lineart)
+        
+        # 2. 检查文件是否存在
+        if not os.path.exists(path_lineart):
+            # 如果不存在（可能是旧图片），则现场生成一次
+            # Fallback logic
+            img, _ = _load_image_from_url_or_path(req.imageUrl)
+            edge_strength = line_art(img)
+            line_art_img = ((1.0 - edge_strength) * 255).astype(np.uint8)
+            cv2.imwrite(path_lineart, line_art_img)
             
-            h, w = labels.shape
-            # 简单校验尺寸
-            if h != img.shape[0] or w != img.shape[1]:
-                # 尺寸不匹配，可能是缩略图？
-                raise HTTPException(status_code=400, detail={"code": 1005, "message": "segmentation data dimension mismatch", "data": None})
-
-            if req.pixel.x < 0 or req.pixel.x >= w or req.pixel.y < 0 or req.pixel.y >= h:
-                raise HTTPException(status_code=400, detail={"code": 1002, "message": "pixel out of range", "data": None})
-
-            label_id = labels[req.pixel.y, req.pixel.x]
-            
-            # 如果点击的是背景(0)或者无效区域
-            if label_id not in palette:
-                 raise HTTPException(status_code=400, detail={"code": 1006, "message": "clicked on invalid segment (background)", "data": None})
-
-            target_rgb = np.array(palette[label_id])
-            masked_image = np.zeros((h, w, 3), dtype=np.uint8)
-            mask = (labels == label_id)
-            masked_image[mask] = target_rgb
-            
-            # 叠加分割线
-            _apply_segmentation_boundaries(masked_image, labels)
-
-        except Exception as e:
-            # 除非是上面主动抛出的 HTTPException，否则捕获并报 500
-            if isinstance(e, HTTPException):
-                raise e
-            raise HTTPException(status_code=500, detail={"code": 2002, "message": f"failed to process segmentation data: {str(e)}", "data": None})
-    
-    # 如果 masked_image 依然是 None (说明不是分割模式)，则走默认逻辑
-    if masked_image is None:
-        # 如果用户显式请求了 layer 但没走进去（理论上上面会报错），这里再次检查
-        if layer and layer != "original":
-             # 如果 layer 不是 original 且 masked_image 为空，说明上面逻辑有漏网之鱼或者 fallback 了
-             # 但我们现在不允许 fallback，所以这里应该是一个异常状态
-             pass
-
-        try:
-            target_rgb = _get_pixel_rgb(img, req.pixel.x, req.pixel.y)
-        except IndexError:
-            raise HTTPException(status_code=400, detail={"code": 1002, "message": "pixel out of range", "data": None})
-        masked_image = _create_masked_image(img, req.pixel.x, req.pixel.y, radius=10)
-
-    # 构造一个临时 imageId 方便生成文件名
-    image_id = f"tmp_{uuid.uuid4().hex[:8]}"
-
-    target_hex, mix_plan, steps = _build_mix_plan(target_rgb)
-    if mix_plan is None:
-        raise HTTPException(status_code=500, detail={"code": 2001, "message": "mix plan failed", "data": None})
-
-    projector_url = _save_processed_image(masked_image, image_id, req.pixel.x, req.pixel.y)
-
-    return {
-        "code": 0,
-        "message": "ok",
-        "data": {
-            "targetColor": {
-                "hex": target_hex,
-                "name": "",  # 暂无颜色命名，可后续扩展色名表
-            },
-            "mixPlan": mix_plan,
-            "steps": steps,
-            "projectorImageUrl": projector_url,
-        },
-    }
+        # 3. 返回 URL
+        rel_path = os.path.relpath(path_lineart, BASE_DIR).replace("\\", "/")
+        line_art_url = _build_public_url_from_static_path(rel_path)
+        
+        return {
+            "code": 0,
+            "message": "ok",
+            "data": {
+                "lineArtUrl": line_art_url
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"code": 3001, "message": f"failed to get line art: {str(e)}", "data": None})
 
 
 def _reconstruct_image_from_labels(labels: np.ndarray, palette: Dict[int, Tuple[int, int, int]]) -> np.ndarray:

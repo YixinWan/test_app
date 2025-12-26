@@ -1,4 +1,4 @@
-# 后端调色服务 API 规范
+# 后端调色服务 API 规范（更新版）
 
 本文件说明 **App ⇄ 调色后端** 的 HTTP API 约定，方便与前端、投影端配合。
 
@@ -46,18 +46,18 @@
   "code": 0,
   "message": "ok",
   "data": {
-    "imageUrl": "http://your-backend/static/originals/origin_001.png"
+    "imageUrl": "http://<BACKEND_BASE_URL>/static/originals/origin_001.png",
+    "segmentedLargeUrl": "http://<BACKEND_BASE_URL>/static/segmented/origin_001_large.png",
+    "segmentedSmallUrl": "http://<BACKEND_BASE_URL>/static/segmented/origin_001_small.png"
   }
 }
 ```
 
-字段说明：
+说明：
 
-- `imageUrl` `string`：
-  - 后端保存后的**完整可访问 URL**（推荐 `http://` 或 `https://` 开头）；
-  - 前端后续会：
-    - 在进入绘画页时，将此 URL 作为 `imageUrl` 传给 `show-original`；
-    - 在未拿到 `imageId` 时，将此 URL 作为 `imageUrl` 传给 `from-click-by-url` 接口。
+- 上传后端会立即生成两张分割图（大色块/小色块）及其分割数据（存于 `static/segmented_data/`）。
+- 线稿图亦会生成并保存在 `static/line_art/`（使用时请参考第 4 节接口）。
+- 为避免堆积旧数据，后端会清理旧的原图、分割图、分割数据与线稿，仅保留本次生成的文件。
 
 > 约定：前端不会把本地路径（如 `blob:...`、`file://...`）传给后续接口，**所有后续接口都只使用这里返回的 `imageUrl`**。
 
@@ -173,116 +173,86 @@
 
 ## 3. 点击取色 + 调色建议接口（核心）
 
-> 目的：前端在用户点击画布时，将点击位置（在原图中的像素坐标）发送给后端，后端返回：
->
-> - 该位置的颜色信息；
-> - 调色方案；
-> - 一张 **已处理好的新图片 URL**，供前端转发给投影仪。
+> 目的：用户点击画布位置，后端返回该位置颜色、调色方案、以及用于投影的图片 URL。
 
-### URL
+### 3.1 使用 `imageId`（推荐）
 
-- `POST /api/color-mix/from-click`
+- URL：`POST /api/color-mix/from-click`
 
-### Request Body
-
-**方案 A：使用 `imageId` 标识原图（推荐）**
+#### Request Body
 
 ```json
 {
   "imageId": "img_001",
-  "pixel": {
-    "x": 530,
-    "y": 240
-  },
-  "ratio": {
-    "x": 0.27,
-    "y": 0.35
-  },
+  "pixel": { "x": 530, "y": 240 },
+  "ratio": { "x": 0.27, "y": 0.35 },
   "layer": "segment_large"
 }
 ```
 
 字段说明：
 
-- `imageId` `string`：原图登记时返回的 ID。
-- `pixel` `object`：点击点在 **原图像素坐标系** 下的位置：
-  - `pixel.x` `number`：0 ≤ x < width。
-  - `pixel.y` `number`：0 ≤ y < height。
-- `ratio` `object`（可选）：点击点在原图上的相对位置，便于后端做容错或其他算法：
-  - `ratio.x` `number`：0.0 ~ 1.0。
-  - `ratio.y` `number`：0.0 ~ 1.0。
-- `layer` `string`（可选）：指定取色和分割的层级，默认为 `segment_large`。
-  - `segment_large`：大色块模式，适合起稿和铺大色（默认）；
-  - `segment_small`：小色块模式，适合深入刻画和丰富细节；
-  - `original`：原图模式，不使用分割逻辑，直接取像素点颜色。
+- `imageId`：`show-original` 返回的 ID。
+- `pixel`：点击点在原图像素坐标系中的位置（越界返回 1002）。
+- `ratio`（可选）：相对坐标（0~1），可用于后端容错。
+- `layer`（可选，默认 `segment_large`）：`segment_large` / `segment_small` / `original`。
 
-**方案 B：直接使用 `imageUrl`（如果无需登记）**
+行为说明：
 
-```json
-{
-  "imageUrl": "https://your-backend/static/originals/origin_001.png",
-  "pixel": { "x": 530, "y": 240 }
-}
-```
+- 分割模式下（`segment_*`）：如分割数据缺失，后端会回退到原图模式并直接返回原图 URL。
+- 原图模式下：直接取像素色，不生成掩膜图；`projectorImageUrl` 为原图 URL。
 
-后端可按需支持其中一种或两种方式，与前端约定即可。当前前端实现：
-
-- 正常情况下：进入绘画页时会先调用 `/api/painting/show-original` 获取 `imageId`，点击取色时优先使用 `imageId` 方案；
-- 仅在调色后端明确支持且协商好的前提下，才会退回使用 `imageUrl` 方案（同样使用第 0 步上传接口返回的 URL）。
-
-### Response Body
+#### Response Body
 
 ```json
 {
   "code": 0,
   "message": "ok",
   "data": {
-    "targetColor": {
-      "hex": "#FF6B6B",
-      "name": "珊瑚红"
-    },
-    "mixPlan": [
-      { "name": "钛白", "color": "#FFFFFF", "ratio": 40 },
-      { "name": "镉红", "color": "#DC143C", "ratio": 35 },
-      { "name": "镉黄", "color": "#FFD700", "ratio": 20 },
-      { "name": "象牙黑", "color": "#000000", "ratio": 5 }
-    ],
-    "projectorImageUrl": "https://your-backend/processed/img_001_530_240.png",
-    "maskImageUrl": "https://your-backend/masks/img_001_530_240_mask.png"
+    "targetColor": { "hex": "#a1b2c3", "name": "" },
+    "mixPlan": [ { "name": "钛白", "color": "#FFFFFF", "ratio": 40.0 } ],
+    "steps": [ { "action": "add", "name": "钛白", "amount": 40 } ],
+    "projectorImageUrl": "http://<BACKEND_BASE_URL>/static/processed/img_001_530_240.png"
   }
 }
 ```
 
-字段说明：
+注：当前实现不返回 `maskImageUrl` 字段；如需掩膜分层，可扩展。
 
-- `targetColor` `object`：点击位置的目标颜色信息：
-  - `hex` `string`：颜色十六进制值（前端会直接用于背景色展示）。
-  - `name` `string`：颜色名称（中文名，如“珊瑚红”）。
-- `mixPlan` `array<object>`：调色方案列表，每一项对应一种颜料：
-  - `name` `string`：颜料名称（如“钛白”、“镉红”）。
-  - `color` `string`：该颜料代表色的十六进制值，用于前端渲染色条。
-  - `ratio` `number`：该颜料在配方中的比例，单位为百分比（0~100）。
-- `projectorImageUrl` `string`：
-  - 一张**已经处理好的新图片**的 HTTP URL（例如在点击区域做了高亮或其他效果）；
-  - **视觉效果**：
-    - 背景为全黑；
-    - 仅保留当前点击所在的色块颜色；
-    - **叠加全图的灰色虚线网格**，标示出所有色块的边界，便于用户定位。
-  - 前端不会再加工，只会把这个 URL 通过 HTTP 转发给投影仪；
-  - 要求投影仪所在网络环境可以直接访问该 URL（局域网或公网均可）。
-- `maskImageUrl` `string`（可选）：
-  - 一张**已经生成好的掩膜/高亮图**的 HTTP URL；
-  - 前端同样不会再加工，而是将该 URL 通过 HTTP 转发给投影仪，由投影仪负责如何叠加或呈现掩膜效果；
-  - 要求与 `projectorImageUrl` 一样可被投影仪访问（通常与调色后端同一域名/IP）。
+### 3.2 直接使用 `imageUrl`
 
-### 使用约定
+- URL：`POST /api/color-mix/from-click-by-url`
 
-前端在点击某一点后，会按以下顺序调用：
+#### Request Body
 
-1. 将点击位置换算为原图像素坐标 `pixel.x / pixel.y`；
-2. 调用 `POST /api/color-mix/from-click`，传入 `imageId` 与 `pixel`；
-3. 根据返回的 `targetColor`、`mixPlan` 更新 App 内的颜色分析与调色建议 UI；
-4. 取出 `projectorImageUrl`，**直接转发给投影仪的 HTTP 接口**（见投影仪规范文档），由投影仪实际拉取并显示该图片。
+```json
+{
+  "imageUrl": "http://<BACKEND_BASE_URL>/static/originals/origin_001.png",
+  "pixel": { "x": 530, "y": 240 },
+  "layer": "segment_large"
+}
+```
+
+字段与行为：
+
+- 未指定 `layer` 时，按文件名后缀推断：`*_large.png` → `segment_large`；`*_small.png` → `segment_small`；否则 `original`。
+- 分割模式下：必须存在 `.pkl` 分割数据；不存在则返回 `1004`（不回退到原图）。
+- 原图模式下：直接取像素色；`projectorImageUrl` 为传入的 `imageUrl`（相对路径会被转换为完整 URL）。
+
+#### Response Body（与 3.1 类似）
+
+```json
+{
+  "code": 0,
+  "message": "ok",
+  "data": {
+    "targetColor": { "hex": "#a1b2c3", "name": "" },
+    "mixPlan": [ { "name": "钛白", "color": "#FFFFFF", "ratio": 40.0 } ],
+    "steps": [ { "action": "add", "name": "钛白", "amount": 40 } ],
+    "projectorImageUrl": "http://<BACKEND_BASE_URL>/static/processed/tmp_abcd1234_530_240.png"
+  }
+}
+```
 
 ---
 
@@ -301,8 +271,13 @@
 - 常见错误场景：
   - `1001`：`imageId` 或 `imageUrl` 不存在或已过期；
   - `1002`：`pixel` 越界（前端传入的坐标超出图片范围）；
-  - `2001`：内部处理错误（颜色分析或调色算法异常）；
-  - `2002`：生成处理后图片失败。
+  - `1003`：`imageUrl` 非 HTTP 或非法绝对路径（`show-original`/读取本地路径校验）。
+  - `1004`：分割数据 `.pkl` 缺失（`from-click-by-url` 在分割模式下不回退）。
+  - `1005`：分割数据尺寸与图像尺寸不匹配。
+  - `1006`：点击到无效分割（背景或 palette 中不存在）。
+  - `2001`：调色方案生成失败（例如缺少 `my_palette.json`）。
+  - `2002`：分割数据处理异常。
+  - `3001`：线稿生成异常。
 
 前端在收到 `code != 0` 时，会根据 `message` 做统一的 Toast 提示或降级处理；`projectorImageUrl` 为空时，不会尝试通知投影仪。
 
@@ -339,7 +314,7 @@
   "code": 0,
   "message": "ok",
   "data": {
-    "lineArtUrl": "http://your-backend/static/processed/origin_001_sketch.png"
+    "lineArtUrl": "http://<BACKEND_BASE_URL>/static/line_art/origin_001_lineart.png"
   }
 }
 ```
@@ -421,7 +396,7 @@
   - 默认使用“方案 A：`imageId + pixel + ratio`”，仅在双方协商后才会用 `imageUrl` 方案；
   - 收到成功响应后，会：
     - 使用 `targetColor` / `mixPlan` 渲染调色建议面板；
-    - 先后将 `projectorImageUrl`、`maskImageUrl` 发送给投影仪 `/show-image` 接口。
+  - 先后将 `projectorImageUrl`、`maskImageUrl` 发送给投影仪 `/show-image` 接口（当前实现不返回 `maskImageUrl`，可按需扩展）。
 
 - 后端需要保证（最小可用版本）：
   - 能根据 `imageId` 找到对应原图（或其内部表示）；
