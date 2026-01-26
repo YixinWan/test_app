@@ -12,9 +12,11 @@ import shutil
 import pickle
 from skimage.segmentation import find_boundaries
 
-from domain import suggest_mix, generate_steps_from_mix
+from domain import suggest_mix, generate_steps_from_mix # 依赖domain/__init__.py 显式导出
 from domain.segmentation import coarse_color_blocks, slic_color_blocks
 from domain.line_art import line_art
+from domain.gray_fade import generate_gray_fade_sequence
+
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ORIGINAL_DIR = os.path.join(BASE_DIR, "static", "originals")
@@ -22,6 +24,7 @@ PROCESSED_DIR = os.path.join(BASE_DIR, "static", "processed")
 SEGMENTED_DIR = os.path.join(BASE_DIR, "static", "segmented")
 SEGMENTED_DATA_DIR = os.path.join(BASE_DIR, "static", "segmented_data")
 LINE_ART_DIR = os.path.join(BASE_DIR, "static", "line_art")
+GRAY_FADE_DIR = os.path.join(BASE_DIR, "static", "gray_fade")
 
 # 后端对外访问的基础 URL，需要与你前端配置的 BACKEND_BASE_URL 保持一致
 # 示例：前端配置为 export const BACKEND_BASE_URL = 'http://172.16.25.51:8000'
@@ -33,6 +36,7 @@ os.makedirs(PROCESSED_DIR, exist_ok=True)
 os.makedirs(SEGMENTED_DIR, exist_ok=True)
 os.makedirs(SEGMENTED_DATA_DIR, exist_ok=True)
 os.makedirs(LINE_ART_DIR, exist_ok=True)
+os.makedirs(GRAY_FADE_DIR, exist_ok=True)
 
 app = FastAPI(title="Painting Helper Backend")
 
@@ -165,6 +169,22 @@ async def upload_original_file(file: UploadFile = File(...)):
     path_lineart = os.path.join(LINE_ART_DIR, filename_lineart)
     cv2.imwrite(path_lineart, line_art_img)
 
+    # --- 生成递进至黑的图 (Gray Fade -> direct black) ---
+    # 将原图逐步直接变黑（不先变灰）。输出至 static/gray_fade/0.png, 1.png, ...
+    gray_fade_steps = int(os.environ.get("GRAY_FADE_STEPS", "12"))
+    try:
+        # 每次上传新图，清空 static/gray_fade 目录中的旧内容
+        _clear_directory_except(GRAY_FADE_DIR, [])
+        rel_fade_paths = generate_gray_fade_sequence(
+            img_rgb,
+            steps=gray_fade_steps,
+            output_root=GRAY_FADE_DIR,
+        )
+        gray_fade_urls = [_build_public_url_from_static_path(p) for p in rel_fade_paths]
+    except Exception as e:
+        print(f"gray_fade generation failed: {e}")
+        gray_fade_urls = []
+
     # --- 清理旧数据 ---
     # 只保留本次生成的4个文件：
     # 1. SEGMENTED_DIR: filename_large, filename_small
@@ -182,6 +202,7 @@ async def upload_original_file(file: UploadFile = File(...)):
             "imageUrl": image_url,
             "segmentedLargeUrl": url_large,
             "segmentedSmallUrl": url_small,
+            "grayFadeUrls": gray_fade_urls,
         },
     }
 
@@ -615,4 +636,6 @@ def _reconstruct_image_from_labels(labels: np.ndarray, palette: Dict[int, Tuple[
 
 
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    # Allow overriding port via environment variable PORT to avoid collisions
+    port = int(os.environ.get("PORT", "8000"))
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)

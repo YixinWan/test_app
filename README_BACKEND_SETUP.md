@@ -41,20 +41,8 @@ pip install -r requirements.txt
 conda env create -f environment.yml
 
 # 2. 激活环境
-conda activate painting-helper
+conda activate paint_helper
 ```
-
-### 2.2 手动安装（可选）
-
-若需手动控制依赖版本，可参考：
-
-```powershell
-pip install fastapi uvicorn[standard] opencv-python-headless numpy scikit-image scipy
-```
-
-> **注意**：
-> - 若本机无 GUI（如服务器环境），推荐使用 `opencv-python-headless`（默认配置）。
-> - 若在本地开发且需要 `cv2.imshow` 等窗口功能，可将 `requirements.txt` 中的 `opencv-python-headless` 改为 `opencv-python`。
 
 ## 3. 运行后端服务
 
@@ -69,6 +57,13 @@ python app.py
 - `http://127.0.0.1:8000`
 
 你可以通过浏览器访问 `http://127.0.0.1:8000/docs` 查看自动生成的 Swagger API 文档，并进行联调测试。
+
+在后端运行：
+```powershell
+cd test_app
+./start.sh   # 开始
+./stop.sh    # 停止
+```
 
 ## 4. 与前端 App 的对接方式
 

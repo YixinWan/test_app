@@ -12,5 +12,9 @@ echo "Starting uvicorn server with reload..."
 # 使用 nohup 后台运行，日志输出到 app.log
 nohup python3 -m uvicorn app:app --host 0.0.0.0 --port 8000 --reload > app.log 2>&1 &
 
+# 记录 PID，便于 stop.sh 关闭
+echo $! > uvicorn.pid
+
 echo "Server is running in background."
 echo "View logs with: tail -f app.log"
+echo "Stop server with: ./stop.sh"
