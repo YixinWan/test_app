@@ -521,9 +521,20 @@ async def color_mix_from_click_by_id(req: ColorMixFromClickByIdRequest):
             target_rgb = _get_pixel_rgb(img, req.pixel.x, req.pixel.y)
         except IndexError:
             raise HTTPException(status_code=400, detail={"code": 1002, "message": "pixel out of range", "data": None})
-        
-        # 原图模式下，不再生成掩膜图，直接返回原图 URL
-        projector_url = _build_public_url_from_static_path(info["imageUrl"])
+
+        # 原图模式下，返回线稿URL而不是原图URL
+        # 1. 获取线稿文件名
+        original_filename = os.path.basename(info["imageUrl"])
+        filename_base = os.path.splitext(original_filename)[0]
+        filename_lineart = f"{filename_base}_lineart.png"
+        path_lineart = os.path.join(LINE_ART_DIR, filename_lineart)
+        # 2. 检查线稿是否存在，不存在则生成
+        if not os.path.exists(path_lineart):
+            line_art_img = line_art(img)
+            cv2.imwrite(path_lineart, line_art_img)
+        # 3. 返回线稿URL
+        rel_path = os.path.relpath(path_lineart, BASE_DIR).replace("\\", "/")
+        projector_url = _build_public_url_from_static_path(rel_path)
 
     # 2. 计算调色配方
     target_hex, mix_plan, steps = _build_mix_plan(target_rgb)
@@ -575,15 +586,18 @@ async def generate_line_art(req: LineArtRequest):
             line_art_img = line_art(img)
             cv2.imwrite(path_lineart, line_art_img)
             
-        # 3. 返回 URL
-        rel_path = os.path.relpath(path_lineart, BASE_DIR).replace("\\", "/")
-        line_art_url = _build_public_url_from_static_path(rel_path)
-        
+        # 3. 返回原图 URL（保持字段名 lineArtUrl，值为原图地址）
+        if req.imageUrl.startswith("http://") or req.imageUrl.startswith("https://"):
+            original_url = req.imageUrl
+        else:
+            rel_original = req.imageUrl.lstrip("/")
+            original_url = _build_public_url_from_static_path(rel_original)
+
         return {
             "code": 0,
             "message": "ok",
             "data": {
-                "lineArtUrl": line_art_url
+                "lineArtUrl": original_url
             }
         }
     except Exception as e:
