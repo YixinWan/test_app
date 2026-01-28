@@ -1,9 +1,17 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Tuple
+from dataclasses import dataclass
+import threading
+import time
+import urllib.request
+import urllib.error
 import uvicorn
+import asyncio
+import json
 import os
 import uuid
 import cv2
@@ -85,6 +93,19 @@ class ColorMixFromClickByUrlRequest(BaseModel):
 class LineArtRequest(BaseModel):
     imageUrl: str
     mode: Optional[str] = "sketch"
+
+
+class LineArtSequenceStartRequest(BaseModel):
+    projectorBaseUrl: str
+    folder: str = "/static/gray_fade"  # 默认使用灰阶序列目录
+    minIndex: int = 0
+    maxIndex: int = 11
+    intervalMs: int = 500
+    loopMode: str = "pingpong"  # "pingpong" | "loop"
+
+
+class LineArtSequenceStopRequest(BaseModel):
+    projectorBaseUrl: str
 
 
 
@@ -207,8 +228,70 @@ async def upload_original_file(file: UploadFile = File(...)):
     }
 
 
+@app.get("/api/projector/gray-fade-stream")
+async def gray_fade_stream(interval: float = 0.5):
+    """Server-Sent Events stream of gray_fade images.
+
+    Behavior:
+    - Emits JSON events {"imageUrl": <full-url>, "index": <int>} every `interval` seconds.
+    - Order: 0..N-1, then N-1..0, and repeats in a loop.
+    - Uses files present under static/gray_fade (numeric PNGs).
+    """
+
+    # Discover available frames under static/gray_fade as integers
+    if not os.path.exists(GRAY_FADE_DIR):
+        raise HTTPException(status_code=404, detail={"code": 4004, "message": "gray_fade directory not found", "data": None})
+
+    indices: List[int] = []
+    for name in os.listdir(GRAY_FADE_DIR):
+        base, ext = os.path.splitext(name)
+        if ext.lower() == ".png":
+            try:
+                idx = int(base)
+                indices.append(idx)
+            except ValueError:
+                continue
+
+    if not indices:
+        raise HTTPException(status_code=404, detail={"code": 4005, "message": "no gray_fade frames available", "data": None})
+
+    indices = sorted(indices)
+
+    # Precompute full URLs for discovered frames
+    rel_paths = [os.path.relpath(os.path.join(GRAY_FADE_DIR, f"{i}.png"), BASE_DIR).replace("\\", "/") for i in indices]
+    urls = [_build_public_url_from_static_path(p) for p in rel_paths]
+
+    async def event_generator():
+        # forward indices then backward
+        forward = list(range(len(indices)))
+        backward = list(reversed(forward))
+        while True:
+            for pos in forward:
+                payload = {"code": 0, "message": "ok", "data": {"imageUrl": urls[pos], "index": indices[pos]}}
+                yield f"data: {json.dumps(payload)}\n\n"
+                await asyncio.sleep(interval)
+            for pos in backward:
+                payload = {"code": 0, "message": "ok", "data": {"imageUrl": urls[pos], "index": indices[pos]}}
+                yield f"data: {json.dumps(payload)}\n\n"
+                await asyncio.sleep(interval)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
 # 简单的内存映射，生产环境可替换为数据库
 IMAGE_REGISTRY: Dict[str, Dict] = {}
+
+
+# 线稿序列播放的运行器定义
+@dataclass
+class _SequenceRunner:
+    thread: threading.Thread
+    stop_event: threading.Event
+    config: Dict[str, object]
+
+
+# 以 projectorBaseUrl 作为 key，管理每台投影仪的独立播放线程
+LINE_ART_SEQUENCE_RUNNERS: Dict[str, _SequenceRunner] = {}
 
 
 def _build_public_url_from_static_path(static_rel_path: str) -> str:
@@ -219,6 +302,113 @@ def _build_public_url_from_static_path(static_rel_path: str) -> str:
     """
     rel_path = static_rel_path.lstrip("/")
     return f"{BACKEND_BASE_URL.rstrip('/')}/{rel_path}"
+
+
+def _resolve_folder_to_abs(folder: str) -> str:
+    """将传入的文件夹路径解析为绝对路径。
+
+    规则：
+    - 以 http(s) 开头的不支持（需要本地静态文件服务），抛错；
+    - 若以 "/static/" 开头，视为以工程根目录 BASE_DIR 为根的相对路径；
+    - 若是绝对路径（如 /home/xxx/...），直接使用；
+    - 其他情况，视为 BASE_DIR 下的相对路径。
+    """
+    if folder.startswith("http://") or folder.startswith("https://"):
+        raise HTTPException(status_code=400, detail={"code": 4101, "message": "folder must be local, not http(s)", "data": None})
+
+    if folder.startswith("/static/"):
+        abs_folder = os.path.join(BASE_DIR, folder.lstrip("/"))
+    elif os.path.isabs(folder):
+        abs_folder = folder
+    else:
+        abs_folder = os.path.join(BASE_DIR, folder)
+
+    abs_folder = os.path.abspath(abs_folder)
+    return abs_folder
+
+
+def _ensure_under_static(abs_path: str) -> str:
+    """确保路径位于 BASE_DIR/static 下，返回其相对 BASE_DIR 的路径（用于构建 URL）。"""
+    static_root = os.path.abspath(os.path.join(BASE_DIR, "static"))
+    if not os.path.commonpath([abs_path, static_root]) == static_root:
+        raise HTTPException(status_code=400, detail={"code": 4102, "message": "folder must be under static/ for HTTP serving", "data": None})
+    rel_to_base = os.path.relpath(abs_path, BASE_DIR).replace("\\", "/")
+    return rel_to_base
+
+
+def _find_index_image_path(folder_abs: str, idx: int) -> Optional[str]:
+    """在给定目录下按序号查找图片文件，支持 png/jpg/jpeg/webp。"""
+    exts = [".png", ".jpg", ".jpeg", ".webp"]
+    for ext in exts:
+        p = os.path.join(folder_abs, f"{idx}{ext}")
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _build_sequence_indices(min_index: int, max_index: int, mode: str) -> List[int]:
+    if max_index < min_index:
+        min_index, max_index = max_index, min_index
+    forward = list(range(min_index, max_index + 1))
+    if mode == "loop":
+        return forward
+    # pingpong：正向 + 反向（去重端点），形成 0..N + N-1..1，然后循环
+    backward = list(range(max_index - 1, min_index, -1))
+    return forward + backward
+
+
+def _post_show_image(projector_base_url: str, image_url: str):
+    """调用投影仪的 /show-image 接口。"""
+    payload = json.dumps({"imageUrl": image_url, "displayMode": "fit"}).encode("utf-8")
+    req = urllib.request.Request(
+        url=f"{projector_base_url.rstrip('/')}/show-image",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            # 读取但不强制解析结果，容错对方实现
+            _ = resp.read()
+    except urllib.error.URLError as e:
+        print(f"[line-art-seq] show-image failed: {e}")
+
+
+def _sequence_worker(stop_event: threading.Event, projector_base_url: str, folder_abs: str, min_index: int, max_index: int, interval_ms: int, loop_mode: str):
+    order = _build_sequence_indices(min_index, max_index, loop_mode)
+    # 仅保留存在的帧索引，至少要有一帧
+    available: List[Tuple[int, str]] = []
+    for i in order:
+        p = _find_index_image_path(folder_abs, i)
+        if p:
+            available.append((i, p))
+    if not available:
+        print(f"[line-art-seq] no frames found in {folder_abs} for {min_index}-{max_index}")
+        return
+
+    # 为 URL 构建准备 static 相对路径
+    while not stop_event.is_set():
+        for idx, abs_path in available:
+            if stop_event.is_set():
+                break
+            try:
+                # 确保路径位于 static 下，构建完整 URL
+                rel_to_base = os.path.relpath(abs_path, BASE_DIR).replace("\\", "/")
+                if not rel_to_base.startswith("static/"):
+                    # 若不在 static 下，无法被投影仪访问
+                    print(f"[line-art-seq] skip non-static path: {abs_path}")
+                    continue
+                img_url = _build_public_url_from_static_path(rel_to_base)
+                _post_show_image(projector_base_url, img_url)
+            except Exception as e:
+                print(f"[line-art-seq] error displaying frame {idx}: {e}")
+            # 以更小步长睡眠，提升停止响应
+            total = max(1, int(interval_ms)) / 1000.0
+            slept = 0.0
+            step = min(0.05, total)
+            while slept < total and not stop_event.is_set():
+                time.sleep(step)
+                slept += step
 
 
 def _load_image_from_url_or_path(image_url: str) -> Tuple[np.ndarray, str]:
@@ -623,6 +813,74 @@ async def generate_line_art(req: LineArtRequest):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail={"code": 3001, "message": f"failed to get line art: {str(e)}", "data": None})
+
+
+@app.post("/api/painting/line-art-sequence/start")
+async def start_line_art_sequence(req: LineArtSequenceStartRequest):
+    # 解析并校验目录
+    folder_param = (req.folder or "").strip()
+    folder_abs = _resolve_folder_to_abs(folder_param)
+    if not os.path.isdir(folder_abs):
+        # 帮助定位：在错误详情中增加解析后的绝对路径
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": 4103,
+                "message": f"folder not found: {req.folder}",
+                "data": {"resolvedPath": folder_abs}
+            }
+        )
+
+    # 至少存在一帧
+    indices = _build_sequence_indices(req.minIndex, req.maxIndex, req.loopMode)
+    found_any = any(_find_index_image_path(folder_abs, i) for i in indices)
+    if not found_any:
+        raise HTTPException(status_code=404, detail={"code": 4104, "message": "no frames found for the given index range", "data": None})
+
+    # 若该投影仪已在播放，先停止
+    existing = LINE_ART_SEQUENCE_RUNNERS.get(req.projectorBaseUrl)
+    if existing is not None:
+        existing.stop_event.set()
+        try:
+            existing.thread.join(timeout=2)
+        except Exception:
+            pass
+        LINE_ART_SEQUENCE_RUNNERS.pop(req.projectorBaseUrl, None)
+
+    stop_event = threading.Event()
+    t = threading.Thread(
+        target=_sequence_worker,
+        args=(stop_event, req.projectorBaseUrl, folder_abs, req.minIndex, req.maxIndex, req.intervalMs, req.loopMode),
+        daemon=True,
+    )
+    t.start()
+    LINE_ART_SEQUENCE_RUNNERS[req.projectorBaseUrl] = _SequenceRunner(
+        thread=t,
+        stop_event=stop_event,
+        config={
+            "folder": req.folder,
+            "minIndex": req.minIndex,
+            "maxIndex": req.maxIndex,
+            "intervalMs": req.intervalMs,
+            "loopMode": req.loopMode,
+        },
+    )
+
+    return {"code": 0, "message": "ok", "data": {"started": True}}
+
+
+@app.post("/api/painting/line-art-sequence/stop")
+async def stop_line_art_sequence(req: LineArtSequenceStopRequest):
+    runner = LINE_ART_SEQUENCE_RUNNERS.get(req.projectorBaseUrl)
+    if runner is not None:
+        runner.stop_event.set()
+        try:
+            runner.thread.join(timeout=2)
+        except Exception:
+            pass
+        LINE_ART_SEQUENCE_RUNNERS.pop(req.projectorBaseUrl, None)
+    # 幂等：即使不存在也返回 stopped: true
+    return {"code": 0, "message": "ok", "data": {"stopped": True}}
 
 
 def _reconstruct_image_from_labels(labels: np.ndarray, palette: Dict[int, Tuple[int, int, int]]) -> np.ndarray:

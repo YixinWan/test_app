@@ -165,3 +165,35 @@
 ---
 
 通过以上约定，前端 App 不需要持有或二次传输图片二进制数据，只需在“调色后端”和“投影仪”之间转发一个 URL，实现点击即自动更新投影画面的效果。
+
+---
+
+## 6. 可选：对接后端灰阶渐黑流（SSE）
+
+> 一些场景需要连续、自动地显示一串图片（如灰阶渐黑过渡）。后端已提供 SSE 流 `GET /api/projector/gray-fade-stream`，前端可订阅该流并将每一帧的 `imageUrl` 转发给投影仪。
+
+### 前端示例
+
+```js
+const es = new EventSource(`${BACKEND_BASE_URL}/api/projector/gray-fade-stream?interval=0.5`);
+
+es.onmessage = async (e) => {
+  const evt = JSON.parse(e.data);
+  const { imageUrl, index } = evt?.data || {};
+  // 将该帧的 URL 转发给投影仪
+  await fetch(`${deviceBaseUrl}/show-image`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ imageUrl, displayMode: 'fit' })
+  });
+};
+
+// 停止流：
+// es.close();
+```
+
+### 行为说明
+
+- 推送顺序：`0..N-1` 然后 `N-1..0` 循环；默认每 0.5s 一帧，可通过 `interval` 调整；
+- 事件体：`{"code":0, "message":"ok", "data": {"imageUrl":"<完整URL>", "index":<帧序号>}}`；
+- 失败场景：后端可能返回 404（目录缺失或无有效帧）。

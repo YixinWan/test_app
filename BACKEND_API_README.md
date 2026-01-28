@@ -325,7 +325,71 @@
 
 ---
 
-## 5. 面向后端同事的实现指引与进度说明
+## 5. 灰阶渐黑投影流（SSE，持续推送）
+
+> 目的：后端持续按“0→11→0 循环、每 0.5s 一张”的节奏，将 `static/gray_fade` 中的图片 URL 通过 SSE 推送给前端；前端拿到每一帧的 `imageUrl` 后，将其转发给投影仪 `/show-image` 显示，实现自动投影渐黑效果。
+
+### URL
+
+- `GET /api/projector/gray-fade-stream`
+
+### Query 参数
+
+| 参数名   | 类型   | 默认值 | 说明                          |
+|----------|--------|--------|-------------------------------|
+| interval | number | 0.5    | 推送间隔（单位：秒），可调节 |
+
+### 响应（SSE 事件流）
+
+- 响应类型：`text/event-stream`
+- 每隔 `interval` 秒推送一条事件，事件数据为 JSON：
+
+```json
+{
+  "code": 0,
+  "message": "ok",
+  "data": {
+    "imageUrl": "http://<BACKEND_BASE_URL>/static/gray_fade/3.png",
+    "index": 3
+  }
+}
+```
+
+### 帧序与循环
+
+- 后端会扫描 `static/gray_fade` 下的数字命名 PNG 文件（如 `0.png`..`11.png`）并排序；
+- 推送顺序为：正序 `0..N-1`，再倒序 `N-1..0`，然后循环；
+- 在拐点处（如 `11`→倒序），首尾帧会连续出现一次（如 `...10,11,11,10...`）。
+
+### 前端对接建议
+
+前端通过 `EventSource` 订阅 SSE 流，每次收到事件后调用投影仪 `/show-image`：
+
+```js
+const es = new EventSource(`${BACKEND_BASE_URL}/api/projector/gray-fade-stream?interval=0.5`);
+
+es.onmessage = async (e) => {
+  const { imageUrl, index } = JSON.parse(e.data);
+  // 将该帧的 URL 转发给投影仪
+  // await fetch(`${deviceBaseUrl}/show-image`, {
+  //   method: 'POST',
+  //   headers: { 'Content-Type': 'application/json' },
+  //   body: JSON.stringify({ imageUrl, displayMode: 'fit' })
+  // });
+};
+
+// 需要停止时
+// es.close();
+```
+
+### 失败场景
+
+- 若 `static/gray_fade` 目录不存在：返回 404，错误码 `4004`；
+- 若目录下无可用帧（无数字 PNG 文件）：返回 404，错误码 `4005`。
+
+---
+
+## 6. 面向后端同事的实现指引与进度说明
 
 本节是专门给后端同事看的，从“当前前端行为 + 后端需要做什么”的角度，梳理一遍实现重点，方便排期和联调。
 
@@ -478,3 +542,97 @@ curl -X POST "http://<BACKEND_BASE_URL>/api/color-mix/from-click" \
   - 后端在日志中打印收到的 `imageId`、`pixel`、`ratio`，方便与前端点击位置核对；
   - 先用简单/固定的调色方案和占位图片 URL 返回，验证前端 UI 和投影仪能否正常反应；
   - 确认所有返回的 URL（尤其是 `projectorImageUrl`、`maskImageUrl`）在投影仪网络中可以访问。
+
+---
+
+## 7. 错误码补充（SSE 流）
+
+- `4004`：`gray_fade` 目录不存在；
+- `4005`：`gray_fade` 目录下无有效帧（未发现数字命名的 PNG）。
+
+---
+
+## 8. 线稿序列投影接口（后端控制播放）
+
+> 目的：前端仅触发开始/停止，后端从指定文件夹按序号 0→11→0 循环取图并投影。推荐由后端直接调用投影仪 `/show-image`，避免前端定时发送。
+
+### 8.1 启动线稿序列
+
+URL
+
+- `POST /api/painting/line-art-sequence/start`
+
+Request Body（`folder` 可不传，默认 `"/static/gray_fade"`）
+
+```json
+{
+  "projectorBaseUrl": "http://192.168.1.20:5000",
+  "folder": "/static/line-art-sequence",
+  "minIndex": 0,
+  "maxIndex": 11,
+  "intervalMs": 500,
+  "loopMode": "pingpong"
+}
+```
+
+字段说明：
+
+- `projectorBaseUrl` `string`：投影仪设备地址（前端已绑定设备时传入）。
+- `folder` `string`：后端存放线稿序列图片的目录（由后端解析并读取）。
+  - 支持相对/绝对/以 `/` 开头的工程内路径；默认值为 `/static/gray_fade`；
+  - 实际投影时，要求该目录位于后端 `static/` 下，文件名按序号命名：`0.png`、`1.jpg`、...；
+  - 支持扩展名：`.png`/`.jpg`/`.jpeg`/`.webp`。
+- `minIndex` `number`：起始序号（默认 0）。
+- `maxIndex` `number`：结束序号（默认 11）。
+- `intervalMs` `number`：帧间隔毫秒数（默认 500）。
+- `loopMode` `string`：循环模式，`pingpong` 表示 0→11→0 循环，`loop` 表示 0..11 循环后直接回到 0。
+
+Response Body
+
+```json
+{
+  "code": 0,
+  "message": "ok",
+  "data": { "started": true }
+}
+```
+
+行为说明：
+
+- 以 `projectorBaseUrl` 作为 key，后端为该设备启动一个后台线程，按设定节奏调用 `POST {projectorBaseUrl}/show-image`；
+- `pingpong` 序列顺序为：`min..max` 然后 `max-1..min+1`，避免端点重复；
+- 若同一设备已在播放，将先停止旧线程再启动新线程（幂等）。
+
+失败场景：
+
+- 目录不存在：404，`code: 4103`；
+- 区间内未找到任何帧：404，`code: 4104`；
+- 非 `static/` 下的目录：400，`code: 4102`（投影仪无法通过 HTTP 访问）。
+
+### 8.2 停止线稿序列
+
+URL
+
+- `POST /api/painting/line-art-sequence/stop`
+
+Request Body
+
+```json
+{ "projectorBaseUrl": "http://192.168.1.20:5000" }
+```
+
+Response Body
+
+```json
+{
+  "code": 0,
+  "message": "ok",
+  "data": { "stopped": true }
+}
+```
+
+实现备注：
+
+- 后端使用后台线程 + 停止信号管理循环投影，间隔以毫秒为单位；
+- 发送给投影仪的请求体为 `{ "imageUrl": "<完整URL>", "displayMode": "fit" }`；
+- 该接口幂等：不存在对应线程时也返回 `stopped: true`。
