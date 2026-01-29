@@ -4,11 +4,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Tuple
-from dataclasses import dataclass
-import threading
-import time
-import urllib.request
-import urllib.error
 import uvicorn
 import asyncio
 import json
@@ -21,9 +16,11 @@ import pickle
 from skimage.segmentation import find_boundaries
 
 from domain import suggest_mix, generate_steps_from_mix # 依赖domain/__init__.py 显式导出
+from domain import segment_hue_masks
 from domain.segmentation import coarse_color_blocks, slic_color_blocks
 from domain.line_art import line_art
 from domain.gray_fade import generate_gray_fade_sequence
+from domain.light import process_color_blocks_directory
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -33,6 +30,9 @@ SEGMENTED_DIR = os.path.join(BASE_DIR, "static", "segmented")
 SEGMENTED_DATA_DIR = os.path.join(BASE_DIR, "static", "segmented_data")
 LINE_ART_DIR = os.path.join(BASE_DIR, "static", "line_art")
 GRAY_FADE_DIR = os.path.join(BASE_DIR, "static", "gray_fade")
+COLOR_BLOCKS_DIR = os.path.join(BASE_DIR, "static", "color_blocks")
+LIGHT_DETAILS_DIR = os.path.join(BASE_DIR, "static", "light_details")
+LIGHT_DIR = os.path.join(BASE_DIR, "static", "light")
 
 # 后端对外访问的基础 URL，需要与你前端配置的 BACKEND_BASE_URL 保持一致
 # 示例：前端配置为 export const BACKEND_BASE_URL = 'http://172.16.25.51:8000'
@@ -41,10 +41,10 @@ BACKEND_BASE_URL = os.environ.get("BACKEND_BASE_URL", "http://172.16.20.50:8000"
 
 os.makedirs(ORIGINAL_DIR, exist_ok=True)
 os.makedirs(PROCESSED_DIR, exist_ok=True)
-os.makedirs(SEGMENTED_DIR, exist_ok=True)
-os.makedirs(SEGMENTED_DATA_DIR, exist_ok=True)
 os.makedirs(LINE_ART_DIR, exist_ok=True)
-os.makedirs(GRAY_FADE_DIR, exist_ok=True)
+os.makedirs(COLOR_BLOCKS_DIR, exist_ok=True)
+os.makedirs(LIGHT_DETAILS_DIR, exist_ok=True)
+os.makedirs(LIGHT_DIR, exist_ok=True)
 
 app = FastAPI(title="Painting Helper Backend")
 
@@ -95,19 +95,6 @@ class LineArtRequest(BaseModel):
     mode: Optional[str] = "sketch"
 
 
-class LineArtSequenceStartRequest(BaseModel):
-    projectorBaseUrl: str
-    folder: str = "/static/gray_fade"  # 默认使用灰阶序列目录
-    minIndex: int = 0
-    maxIndex: int = 11
-    intervalMs: int = 500
-    loopMode: str = "pingpong"  # "pingpong" | "loop"
-
-
-class LineArtSequenceStopRequest(BaseModel):
-    projectorBaseUrl: str
-
-
 
 @app.post("/api/painting/upload-original-file")
 async def upload_original_file(file: UploadFile = File(...)):
@@ -135,52 +122,13 @@ async def upload_original_file(file: UploadFile = File(...)):
     # 只保留本次上传的 filename
     _clear_directory_except(ORIGINAL_DIR, [filename])
 
-    # --- 生成分割图 (大色块 & 小色块) ---
-    # 读取图片 (OpenCV BGR -> RGB)
+    # 读取图片以供后续处理 (OpenCV BGR -> RGB)
     img_bgr = cv2.imread(save_path)
     if img_bgr is None:
-        # 理论上不应该发生，除非文件写入失败
-        raise HTTPException(status_code=500, detail="Failed to read saved image for segmentation")
+        raise HTTPException(status_code=500, detail="Failed to read saved image after upload")
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-    # 1. 生成大色块图 (Coarse / Large Segments)
-    # 使用较少的 segments 和较大的 absorb_area_thresh
-    labels_large, palette_large = coarse_color_blocks(
-        img_rgb,
-        slic_segments=70,       # 分割数少
-        force_merge_thresh=0.01  # 结构线约束
-    )
-    img_large = _reconstruct_image_from_labels(labels_large, palette_large)
-    
     filename_base = os.path.splitext(filename)[0]
-    filename_large = f"{filename_base}_large.png"
-    path_large = os.path.join(SEGMENTED_DIR, filename_large)
-    # 保存为 BGR
-    cv2.imwrite(path_large, cv2.cvtColor(img_large, cv2.COLOR_RGB2BGR))
-    url_large = _build_public_url_from_static_path(os.path.relpath(path_large, BASE_DIR).replace("\\", "/"))
-
-    # 保存 Large 数据的 labels 和 palette
-    data_large_path = os.path.join(SEGMENTED_DATA_DIR, f"{filename_base}_large.pkl")
-    with open(data_large_path, "wb") as f:
-        pickle.dump({"labels": labels_large, "palette": palette_large}, f)
-
-    # 2. 生成小色块图 (Fine / Small Segments)
-    # 使用 slic_color_blocks 生成较多细节的超像素
-    labels_small, palette_small = slic_color_blocks(
-        img_rgb,
-        target_segments=500
-    )
-    img_small = _reconstruct_image_from_labels(labels_small, palette_small)
-
-    filename_small = f"{filename_base}_small.png"
-    path_small = os.path.join(SEGMENTED_DIR, filename_small)
-    cv2.imwrite(path_small, cv2.cvtColor(img_small, cv2.COLOR_RGB2BGR))
-    url_small = _build_public_url_from_static_path(os.path.relpath(path_small, BASE_DIR).replace("\\", "/"))
-
-    # 保存 Small 数据的 labels 和 palette
-    data_small_path = os.path.join(SEGMENTED_DATA_DIR, f"{filename_base}_small.pkl")
-    with open(data_small_path, "wb") as f:
-        pickle.dump({"labels": labels_small, "palette": palette_small}, f)
 
     # --- 生成线稿图 (Line Art) ---
     # 新的 line_art 返回素描风格灰度图（uint8，白底黑线），可直接保存
@@ -190,40 +138,108 @@ async def upload_original_file(file: UploadFile = File(...)):
     path_lineart = os.path.join(LINE_ART_DIR, filename_lineart)
     cv2.imwrite(path_lineart, line_art_img)
 
-    # --- 生成递进至黑的图 (Gray Fade -> direct black) ---
-    # 将原图逐步直接变黑（不先变灰）。输出至 static/gray_fade/0.png, 1.png, ...
-    gray_fade_steps = int(os.environ.get("GRAY_FADE_STEPS", "12"))
+    # --- 生成原图色块图（按色块大小降序）---
     try:
-        # 每次上传新图，清空 static/gray_fade 目录中的旧内容
-        _clear_directory_except(GRAY_FADE_DIR, [])
-        rel_fade_paths = generate_gray_fade_sequence(
+        # 每次上传新图，清空 static/color_blocks 目录
+        _clear_directory_except(COLOR_BLOCKS_DIR, [])
+        masks, blocks = segment_hue_masks(
             img_rgb,
-            steps=gray_fade_steps,
-            output_root=GRAY_FADE_DIR,
+            input_bgr=False,
+            min_saturation=0.1,
+            min_value=0.1,
+            bin_size_deg=2,
+            smooth_sigma_deg=6,
+            min_prominence_ratio=0.01,  # 放宽峰显著性，避免遗漏真实色块
+            min_ratio=0.0,              # 不过滤小块，交给形态学 min_area 处理
+            open_size=3,
+            close_size=7,
+            iterations_open=1,
+            iterations_close=1,
+            min_area=None,
         )
-        gray_fade_urls = [_build_public_url_from_static_path(p) for p in rel_fade_paths]
-    except Exception as e:
-        print(f"gray_fade generation failed: {e}")
-        gray_fade_urls = []
+        color_block_files = []
+        for i, mask in enumerate(masks):
+            # 用原图 BGR 与掩码相与，保留该色块的原始颜色
+            block_img = cv2.bitwise_and(img_bgr, img_bgr, mask=mask)
+            fname = f"{i}.png"
+            fpath = os.path.join(COLOR_BLOCKS_DIR, fname)
+            cv2.imwrite(fpath, block_img)
+            color_block_files.append(fname)
+        # 清理目录中非本次生成的文件
+        _clear_directory_except(COLOR_BLOCKS_DIR, color_block_files)
+        color_block_urls = [
+            _build_public_url_from_static_path(
+                os.path.relpath(os.path.join(COLOR_BLOCKS_DIR, f), BASE_DIR).replace("\\", "/")
+            )
+            for f in color_block_files
+        ]
 
-    # --- 清理旧数据 ---
-    # 只保留本次生成的4个文件：
-    # 1. SEGMENTED_DIR: filename_large, filename_small
-    # 2. SEGMENTED_DATA_DIR: filename_base_large.pkl, filename_base_small.pkl
-    # 3. LINE_ART_DIR: filename_lineart
-    
-    _clear_directory_except(SEGMENTED_DIR, [filename_large, filename_small])
-    _clear_directory_except(SEGMENTED_DATA_DIR, [os.path.basename(data_large_path), os.path.basename(data_small_path)])
+        # --- light_details ---
+        # 可通过环境变量调整阈值（便于细节处理）：LIGHT_V_PERCENTILE / LIGHT_S_PERCENTILE
+        v_thr = float(os.environ.get("LIGHT_V_PERCENTILE", "0.95"))
+        s_thr = float(os.environ.get("LIGHT_S_PERCENTILE", "0.10"))
+
+        # 清空旧的 light_details
+        _clear_directory_except(LIGHT_DETAILS_DIR, [])
+        _ = process_color_blocks_directory(
+            input_dir=COLOR_BLOCKS_DIR,
+            output_dir=LIGHT_DETAILS_DIR,
+            v_percentile=v_thr,
+            s_percentile=s_thr,
+            morph_kernel_size=1,
+            min_region_area=10,
+        )
+        # 仅返回与当前 color_block_files 对应的亮部掩码 URL（按同名文件）
+        light_detail_urls = [
+            _build_public_url_from_static_path(
+                os.path.relpath(os.path.join(LIGHT_DETAILS_DIR, f), BASE_DIR).replace("\\", "/")
+            )
+            for f in color_block_files
+            if os.path.exists(os.path.join(LIGHT_DETAILS_DIR, f))
+        ]
+
+        # --- light ---
+        v_thr = float(os.environ.get("LIGHT_V_PERCENTILE", "0.80"))
+        s_thr = float(os.environ.get("LIGHT_S_PERCENTILE", "0.10"))
+
+        # 清空旧的 light
+        _clear_directory_except(LIGHT_DIR, [])
+        _ = process_color_blocks_directory(
+            input_dir=COLOR_BLOCKS_DIR,
+            output_dir=LIGHT_DIR,
+            v_percentile=v_thr,
+            s_percentile=s_thr,
+            morph_kernel_size=1,
+            min_region_area=10,
+        )
+        # 仅返回与当前 color_block_files 对应的亮部掩码 URL（按同名文件）
+        light_urls = [
+            _build_public_url_from_static_path(
+                os.path.relpath(os.path.join(LIGHT_DIR, f), BASE_DIR).replace("\\", "/")
+            )
+            for f in color_block_files
+            if os.path.exists(os.path.join(LIGHT_DIR, f))
+        ]
+    except Exception as e:
+        print(f"color blocks generation failed: {e}")
+        color_block_urls = []
+        light_urls = []
+
+    # --- 清理旧的派生数据 ---
+    # 保留线稿与本次生成的 color_blocks，清理多余文件
     _clear_directory_except(LINE_ART_DIR, [filename_lineart])
+    _clear_directory_except(COLOR_BLOCKS_DIR, [os.path.basename(url.split('/static/')[-1]) for url in color_block_urls])
+    _clear_directory_except(LIGHT_DETAILS_DIR, [os.path.basename(url.split('/static/')[-1]) for url in light_detail_urls])
+    _clear_directory_except(LIGHT_DIR, [os.path.basename(url.split('/static/')[-1]) for url in light_urls])
 
     return {
         "code": 0,
         "message": "ok",
         "data": {
             "imageUrl": image_url,
-            "segmentedLargeUrl": url_large,
-            "segmentedSmallUrl": url_small,
-            "grayFadeUrls": gray_fade_urls,
+            "colorBlockUrls": color_block_urls,
+            "lightDetailUrls": light_detail_urls,
+            "lightUrls": light_urls,
         },
     }
 
@@ -282,18 +298,6 @@ async def gray_fade_stream(interval: float = 0.5):
 IMAGE_REGISTRY: Dict[str, Dict] = {}
 
 
-# 线稿序列播放的运行器定义
-@dataclass
-class _SequenceRunner:
-    thread: threading.Thread
-    stop_event: threading.Event
-    config: Dict[str, object]
-
-
-# 以 projectorBaseUrl 作为 key，管理每台投影仪的独立播放线程
-LINE_ART_SEQUENCE_RUNNERS: Dict[str, _SequenceRunner] = {}
-
-
 def _build_public_url_from_static_path(static_rel_path: str) -> str:
     """将 static 下的相对路径转换为完整可访问 URL。
 
@@ -302,113 +306,6 @@ def _build_public_url_from_static_path(static_rel_path: str) -> str:
     """
     rel_path = static_rel_path.lstrip("/")
     return f"{BACKEND_BASE_URL.rstrip('/')}/{rel_path}"
-
-
-def _resolve_folder_to_abs(folder: str) -> str:
-    """将传入的文件夹路径解析为绝对路径。
-
-    规则：
-    - 以 http(s) 开头的不支持（需要本地静态文件服务），抛错；
-    - 若以 "/static/" 开头，视为以工程根目录 BASE_DIR 为根的相对路径；
-    - 若是绝对路径（如 /home/xxx/...），直接使用；
-    - 其他情况，视为 BASE_DIR 下的相对路径。
-    """
-    if folder.startswith("http://") or folder.startswith("https://"):
-        raise HTTPException(status_code=400, detail={"code": 4101, "message": "folder must be local, not http(s)", "data": None})
-
-    if folder.startswith("/static/"):
-        abs_folder = os.path.join(BASE_DIR, folder.lstrip("/"))
-    elif os.path.isabs(folder):
-        abs_folder = folder
-    else:
-        abs_folder = os.path.join(BASE_DIR, folder)
-
-    abs_folder = os.path.abspath(abs_folder)
-    return abs_folder
-
-
-def _ensure_under_static(abs_path: str) -> str:
-    """确保路径位于 BASE_DIR/static 下，返回其相对 BASE_DIR 的路径（用于构建 URL）。"""
-    static_root = os.path.abspath(os.path.join(BASE_DIR, "static"))
-    if not os.path.commonpath([abs_path, static_root]) == static_root:
-        raise HTTPException(status_code=400, detail={"code": 4102, "message": "folder must be under static/ for HTTP serving", "data": None})
-    rel_to_base = os.path.relpath(abs_path, BASE_DIR).replace("\\", "/")
-    return rel_to_base
-
-
-def _find_index_image_path(folder_abs: str, idx: int) -> Optional[str]:
-    """在给定目录下按序号查找图片文件，支持 png/jpg/jpeg/webp。"""
-    exts = [".png", ".jpg", ".jpeg", ".webp"]
-    for ext in exts:
-        p = os.path.join(folder_abs, f"{idx}{ext}")
-        if os.path.exists(p):
-            return p
-    return None
-
-
-def _build_sequence_indices(min_index: int, max_index: int, mode: str) -> List[int]:
-    if max_index < min_index:
-        min_index, max_index = max_index, min_index
-    forward = list(range(min_index, max_index + 1))
-    if mode == "loop":
-        return forward
-    # pingpong：正向 + 反向（去重端点），形成 0..N + N-1..1，然后循环
-    backward = list(range(max_index - 1, min_index, -1))
-    return forward + backward
-
-
-def _post_show_image(projector_base_url: str, image_url: str):
-    """调用投影仪的 /show-image 接口。"""
-    payload = json.dumps({"imageUrl": image_url, "displayMode": "fit"}).encode("utf-8")
-    req = urllib.request.Request(
-        url=f"{projector_base_url.rstrip('/')}/show-image",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            # 读取但不强制解析结果，容错对方实现
-            _ = resp.read()
-    except urllib.error.URLError as e:
-        print(f"[line-art-seq] show-image failed: {e}")
-
-
-def _sequence_worker(stop_event: threading.Event, projector_base_url: str, folder_abs: str, min_index: int, max_index: int, interval_ms: int, loop_mode: str):
-    order = _build_sequence_indices(min_index, max_index, loop_mode)
-    # 仅保留存在的帧索引，至少要有一帧
-    available: List[Tuple[int, str]] = []
-    for i in order:
-        p = _find_index_image_path(folder_abs, i)
-        if p:
-            available.append((i, p))
-    if not available:
-        print(f"[line-art-seq] no frames found in {folder_abs} for {min_index}-{max_index}")
-        return
-
-    # 为 URL 构建准备 static 相对路径
-    while not stop_event.is_set():
-        for idx, abs_path in available:
-            if stop_event.is_set():
-                break
-            try:
-                # 确保路径位于 static 下，构建完整 URL
-                rel_to_base = os.path.relpath(abs_path, BASE_DIR).replace("\\", "/")
-                if not rel_to_base.startswith("static/"):
-                    # 若不在 static 下，无法被投影仪访问
-                    print(f"[line-art-seq] skip non-static path: {abs_path}")
-                    continue
-                img_url = _build_public_url_from_static_path(rel_to_base)
-                _post_show_image(projector_base_url, img_url)
-            except Exception as e:
-                print(f"[line-art-seq] error displaying frame {idx}: {e}")
-            # 以更小步长睡眠，提升停止响应
-            total = max(1, int(interval_ms)) / 1000.0
-            slept = 0.0
-            step = min(0.05, total)
-            while slept < total and not stop_event.is_set():
-                time.sleep(step)
-                slept += step
 
 
 def _load_image_from_url_or_path(image_url: str) -> Tuple[np.ndarray, str]:
@@ -813,74 +710,6 @@ async def generate_line_art(req: LineArtRequest):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail={"code": 3001, "message": f"failed to get line art: {str(e)}", "data": None})
-
-
-@app.post("/api/painting/line-art-sequence/start")
-async def start_line_art_sequence(req: LineArtSequenceStartRequest):
-    # 解析并校验目录
-    folder_param = (req.folder or "").strip()
-    folder_abs = _resolve_folder_to_abs(folder_param)
-    if not os.path.isdir(folder_abs):
-        # 帮助定位：在错误详情中增加解析后的绝对路径
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "code": 4103,
-                "message": f"folder not found: {req.folder}",
-                "data": {"resolvedPath": folder_abs}
-            }
-        )
-
-    # 至少存在一帧
-    indices = _build_sequence_indices(req.minIndex, req.maxIndex, req.loopMode)
-    found_any = any(_find_index_image_path(folder_abs, i) for i in indices)
-    if not found_any:
-        raise HTTPException(status_code=404, detail={"code": 4104, "message": "no frames found for the given index range", "data": None})
-
-    # 若该投影仪已在播放，先停止
-    existing = LINE_ART_SEQUENCE_RUNNERS.get(req.projectorBaseUrl)
-    if existing is not None:
-        existing.stop_event.set()
-        try:
-            existing.thread.join(timeout=2)
-        except Exception:
-            pass
-        LINE_ART_SEQUENCE_RUNNERS.pop(req.projectorBaseUrl, None)
-
-    stop_event = threading.Event()
-    t = threading.Thread(
-        target=_sequence_worker,
-        args=(stop_event, req.projectorBaseUrl, folder_abs, req.minIndex, req.maxIndex, req.intervalMs, req.loopMode),
-        daemon=True,
-    )
-    t.start()
-    LINE_ART_SEQUENCE_RUNNERS[req.projectorBaseUrl] = _SequenceRunner(
-        thread=t,
-        stop_event=stop_event,
-        config={
-            "folder": req.folder,
-            "minIndex": req.minIndex,
-            "maxIndex": req.maxIndex,
-            "intervalMs": req.intervalMs,
-            "loopMode": req.loopMode,
-        },
-    )
-
-    return {"code": 0, "message": "ok", "data": {"started": True}}
-
-
-@app.post("/api/painting/line-art-sequence/stop")
-async def stop_line_art_sequence(req: LineArtSequenceStopRequest):
-    runner = LINE_ART_SEQUENCE_RUNNERS.get(req.projectorBaseUrl)
-    if runner is not None:
-        runner.stop_event.set()
-        try:
-            runner.thread.join(timeout=2)
-        except Exception:
-            pass
-        LINE_ART_SEQUENCE_RUNNERS.pop(req.projectorBaseUrl, None)
-    # 幂等：即使不存在也返回 stopped: true
-    return {"code": 0, "message": "ok", "data": {"stopped": True}}
 
 
 def _reconstruct_image_from_labels(labels: np.ndarray, palette: Dict[int, Tuple[int, int, int]]) -> np.ndarray:
