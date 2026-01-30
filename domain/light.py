@@ -22,7 +22,7 @@ def bright_mask_for_block(
     block_bgr: np.ndarray,
     *,
     v_percentile: float = 0.80,
-    s_percentile: float = 0.50,
+    s_percentile: float = 0.10,
     morph_kernel_size: int = 1,
     min_region_area: int = 10,
 ) -> Tuple[np.ndarray, List[Tuple[int, float, float]]]:
@@ -75,8 +75,8 @@ def bright_mask_for_block(
         thr_s = float(np.quantile(s_vals, s_percentile))
         thresholds.append((lab, thr_v, thr_s))
 
-        # 亮部条件：V >= thr_v 且 S >= thr_s
-        comp_bright = comp_mask & (v_full >= thr_v) & (s_full >= thr_s)
+        # 亮部条件：V >= thr_v 且 S <= thr_s
+        comp_bright = comp_mask & (v_full >= thr_v) & (s_full <= thr_s)
 
         # 形态学开运算去噪
         if morph_kernel_size and morph_kernel_size > 0:
@@ -89,7 +89,7 @@ def bright_mask_for_block(
     return white_mask, thresholds
 
 
-def process_color_blocks_directory(
+def process_light_color_blocks_directory(
     input_dir: str,
     output_dir: str,
     *,
@@ -139,5 +139,5 @@ def process_color_blocks_directory(
 # 模块导出（便于在 app.py 中调用）
 __all__ = [
     "bright_mask_for_block",
-    "process_color_blocks_directory",
+    "process_light_color_blocks_directory",
 ]

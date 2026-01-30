@@ -17,10 +17,9 @@ from skimage.segmentation import find_boundaries
 
 from domain import suggest_mix, generate_steps_from_mix # 依赖domain/__init__.py 显式导出
 from domain import segment_hue_masks
-from domain.segmentation import coarse_color_blocks, slic_color_blocks
 from domain.line_art import line_art
-from domain.gray_fade import generate_gray_fade_sequence
-from domain.light import process_color_blocks_directory
+from domain.light import process_light_color_blocks_directory
+from domain.dark import process_dark_color_blocks_directory
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -33,6 +32,8 @@ GRAY_FADE_DIR = os.path.join(BASE_DIR, "static", "gray_fade")
 COLOR_BLOCKS_DIR = os.path.join(BASE_DIR, "static", "color_blocks")
 LIGHT_DETAILS_DIR = os.path.join(BASE_DIR, "static", "light_details")
 LIGHT_DIR = os.path.join(BASE_DIR, "static", "light")
+DARK_DETAILS_DIR = os.path.join(BASE_DIR, "static", "dark_details")
+DARK_DIR = os.path.join(BASE_DIR, "static", "dark")
 
 # 后端对外访问的基础 URL，需要与你前端配置的 BACKEND_BASE_URL 保持一致
 # 示例：前端配置为 export const BACKEND_BASE_URL = 'http://172.16.25.51:8000'
@@ -45,6 +46,8 @@ os.makedirs(LINE_ART_DIR, exist_ok=True)
 os.makedirs(COLOR_BLOCKS_DIR, exist_ok=True)
 os.makedirs(LIGHT_DETAILS_DIR, exist_ok=True)
 os.makedirs(LIGHT_DIR, exist_ok=True)
+os.makedirs(DARK_DETAILS_DIR, exist_ok=True)
+os.makedirs(DARK_DIR, exist_ok=True)
 
 app = FastAPI(title="Painting Helper Backend")
 
@@ -104,9 +107,9 @@ async def upload_original_file(file: UploadFile = File(...)):
     - 入参：multipart/form-data, 字段名为 file
     - 出参：data.imageUrl 为后端可直接访问的完整 HTTP URL
     """
-    # 简单按随机前缀避免重名覆盖
+    # 固定命名为 0，保留原始扩展名（例如 0.jpg / 0.png）
     ext = os.path.splitext(file.filename or "")[1] or ".png"
-    filename = f"origin_{uuid.uuid4().hex[:8]}{ext}"
+    filename = f"0{ext}"
     save_path = os.path.join(ORIGINAL_DIR, filename)
 
     # 保存上传的文件内容
@@ -134,7 +137,8 @@ async def upload_original_file(file: UploadFile = File(...)):
     # 新的 line_art 返回素描风格灰度图（uint8，白底黑线），可直接保存
     line_art_img = line_art(img_rgb)
     
-    filename_lineart = f"{filename_base}_lineart.png"
+    # 线稿固定命名为 0.png
+    filename_lineart = "0.png"
     path_lineart = os.path.join(LINE_ART_DIR, filename_lineart)
     cv2.imwrite(path_lineart, line_art_img)
 
@@ -174,14 +178,14 @@ async def upload_original_file(file: UploadFile = File(...)):
             for f in color_block_files
         ]
 
-        # --- light_details ---
+    # --- light_details 亮部细节---
         # 可通过环境变量调整阈值（便于细节处理）：LIGHT_V_PERCENTILE / LIGHT_S_PERCENTILE
-        v_thr = float(os.environ.get("LIGHT_V_PERCENTILE", "0.95"))
+        v_thr = float(os.environ.get("LIGHT_V_PERCENTILE", "0.80"))
         s_thr = float(os.environ.get("LIGHT_S_PERCENTILE", "0.10"))
 
         # 清空旧的 light_details
         _clear_directory_except(LIGHT_DETAILS_DIR, [])
-        _ = process_color_blocks_directory(
+        _ = process_light_color_blocks_directory(
             input_dir=COLOR_BLOCKS_DIR,
             output_dir=LIGHT_DETAILS_DIR,
             v_percentile=v_thr,
@@ -198,18 +202,18 @@ async def upload_original_file(file: UploadFile = File(...)):
             if os.path.exists(os.path.join(LIGHT_DETAILS_DIR, f))
         ]
 
-        # --- light ---
-        v_thr = float(os.environ.get("LIGHT_V_PERCENTILE", "0.80"))
-        s_thr = float(os.environ.get("LIGHT_S_PERCENTILE", "0.10"))
+    # --- light 亮部---
+        v_thr = float(os.environ.get("LIGHT_V_PERCENTILE", "0.70"))
+        s_thr = float(os.environ.get("LIGHT_S_PERCENTILE", "0.50"))
 
         # 清空旧的 light
         _clear_directory_except(LIGHT_DIR, [])
-        _ = process_color_blocks_directory(
+        _ = process_light_color_blocks_directory(
             input_dir=COLOR_BLOCKS_DIR,
             output_dir=LIGHT_DIR,
             v_percentile=v_thr,
             s_percentile=s_thr,
-            morph_kernel_size=1,
+            morph_kernel_size=3,
             min_region_area=10,
         )
         # 仅返回与当前 color_block_files 对应的亮部掩码 URL（按同名文件）
@@ -220,10 +224,56 @@ async def upload_original_file(file: UploadFile = File(...)):
             for f in color_block_files
             if os.path.exists(os.path.join(LIGHT_DIR, f))
         ]
+
+    # --- dark_details 暗部细节---
+        # 通过环境变量调整暗部阈值：DARK_V_PERCENTILE（暗部用更低的V分位）
+        v_thr_dark = float(os.environ.get("DARK_V_PERCENTILE", "0.02"))
+
+        # 清空旧的 dark_details
+        _clear_directory_except(DARK_DETAILS_DIR, [])
+        _ = process_dark_color_blocks_directory(
+            input_dir=COLOR_BLOCKS_DIR,
+            output_dir=DARK_DETAILS_DIR,
+            v_percentile=v_thr_dark,
+            morph_kernel_size=1,
+            min_region_area=10,
+        )
+        # 与当前 color_block_files 对应的暗部掩码 URL（按同名文件）
+        dark_detail_urls = [
+            _build_public_url_from_static_path(
+                os.path.relpath(os.path.join(DARK_DETAILS_DIR, f), BASE_DIR).replace("\\", "/")
+            )
+            for f in color_block_files
+            if os.path.exists(os.path.join(DARK_DETAILS_DIR, f))
+        ]
+    # --- dark 暗部---
+        # 通过环境变量调整暗部阈值：DARK_V_PERCENTILE（暗部用更低的V分位）
+        v_thr_dark = float(os.environ.get("DARK_V_PERCENTILE", "0.30"))
+
+        # 清空旧的 dark
+        _clear_directory_except(DARK_DIR, [])
+        _ = process_dark_color_blocks_directory(
+            input_dir=COLOR_BLOCKS_DIR,
+            output_dir=DARK_DIR,
+            v_percentile=v_thr_dark,
+            morph_kernel_size=3,
+            min_region_area=10,
+        )
+        # 与当前 color_block_files 对应的暗部掩码 URL（按同名文件）
+        dark_urls = [
+            _build_public_url_from_static_path(
+                os.path.relpath(os.path.join(DARK_DIR, f), BASE_DIR).replace("\\", "/")
+            )
+            for f in color_block_files
+            if os.path.exists(os.path.join(DARK_DIR, f))
+        ]
+    
     except Exception as e:
         print(f"color blocks generation failed: {e}")
         color_block_urls = []
         light_urls = []
+        dark_detail_urls = []
+        dark_urls = []
 
     # --- 清理旧的派生数据 ---
     # 保留线稿与本次生成的 color_blocks，清理多余文件
@@ -231,6 +281,8 @@ async def upload_original_file(file: UploadFile = File(...)):
     _clear_directory_except(COLOR_BLOCKS_DIR, [os.path.basename(url.split('/static/')[-1]) for url in color_block_urls])
     _clear_directory_except(LIGHT_DETAILS_DIR, [os.path.basename(url.split('/static/')[-1]) for url in light_detail_urls])
     _clear_directory_except(LIGHT_DIR, [os.path.basename(url.split('/static/')[-1]) for url in light_urls])
+    _clear_directory_except(DARK_DETAILS_DIR, [os.path.basename(url.split('/static/')[-1]) for url in dark_detail_urls])
+    _clear_directory_except(DARK_DIR, [os.path.basename(url.split('/static/')[-1]) for url in dark_urls])
 
     return {
         "code": 0,
@@ -240,6 +292,8 @@ async def upload_original_file(file: UploadFile = File(...)):
             "colorBlockUrls": color_block_urls,
             "lightDetailUrls": light_detail_urls,
             "lightUrls": light_urls,
+            "darkDetailUrls": dark_detail_urls,
+            "darkUrls": dark_urls,
         },
     }
 
@@ -630,11 +684,8 @@ async def color_mix_from_click_by_id(req: ColorMixFromClickByIdRequest):
         except IndexError:
             raise HTTPException(status_code=400, detail={"code": 1002, "message": "pixel out of range", "data": None})
 
-        # 原图模式下，返回线稿URL而不是原图URL
-        # 1. 获取线稿文件名
-        original_filename = os.path.basename(info["imageUrl"])
-        filename_base = os.path.splitext(original_filename)[0]
-        filename_lineart = f"{filename_base}_lineart.png"
+        # 原图模式下，返回线稿URL而不是原图URL（线稿固定为 static/line_art/0.png）
+        filename_lineart = "0.png"
         path_lineart = os.path.join(LINE_ART_DIR, filename_lineart)
         # 2. 检查线稿是否存在，不存在则生成
         if not os.path.exists(path_lineart):
@@ -671,21 +722,10 @@ async def color_mix_from_click_by_id(req: ColorMixFromClickByIdRequest):
 @app.post("/api/painting/line-art")
 async def generate_line_art(req: LineArtRequest):
     try:
-        # 1. 尝试从 imageUrl 中解析出 filename_base
-        # imageUrl 可能是 "static/originals/origin_xxx.png"
-        # 我们需要找到对应的 "origin_xxx_lineart.png"
-        
-        # 如果是完整 URL，先转相对路径
-        if req.imageUrl.startswith("http://") or req.imageUrl.startswith("https://"):
-             # 简单处理：取最后的文件名
-             original_filename = os.path.basename(req.imageUrl)
-        else:
-             original_filename = os.path.basename(req.imageUrl)
-             
-        filename_base = os.path.splitext(original_filename)[0]
-        filename_lineart = f"{filename_base}_lineart.png"
+        # 线稿固定为 static/line_art/0.png
+        filename_lineart = "0.png"
         path_lineart = os.path.join(LINE_ART_DIR, filename_lineart)
-        
+
         # 2. 检查文件是否存在
         if not os.path.exists(path_lineart):
             # 如果不存在（可能是旧图片），则现场生成一次
@@ -693,7 +733,7 @@ async def generate_line_art(req: LineArtRequest):
             img, _ = _load_image_from_url_or_path(req.imageUrl)
             line_art_img = line_art(img)
             cv2.imwrite(path_lineart, line_art_img)
-            
+
         # 3. 返回原图 URL（保持字段名 lineArtUrl，值为原图地址）
         if req.imageUrl.startswith("http://") or req.imageUrl.startswith("https://"):
             original_url = req.imageUrl

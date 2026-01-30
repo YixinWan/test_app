@@ -7,13 +7,13 @@ def detect_hue_blocks(
     img: np.ndarray,
     *,
     input_bgr: bool = False,
-    min_saturation: float = 0.1,
-    min_value: float = 0.1,
-    bin_size_deg: int = 2,
-    smooth_sigma_deg: int = 6,
+    min_saturation: float = 0.05,
+    min_value: float = 0.05,
+    bin_size_deg: int = 1,
+    smooth_sigma_deg: int = 4,
     min_prominence_ratio: float = 0.05,
     coverage_mode: str = "valley",
-    min_ratio: float = 0.05,
+    min_ratio: float = 0.1,
 ) -> Dict[str, np.ndarray | List[Dict[str, float]]]:
     """
     基于色相直方图的波峰自动检测与色块划分。
