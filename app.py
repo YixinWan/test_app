@@ -227,7 +227,7 @@ async def upload_original_file(file: UploadFile = File(...)):
 
     # --- dark_details 暗部细节---
         # 通过环境变量调整暗部阈值：DARK_V_PERCENTILE（暗部用更低的V分位）
-        v_thr_dark = float(os.environ.get("DARK_V_PERCENTILE", "0.02"))
+        v_thr_dark = float(os.environ.get("DARK_V_PERCENTILE", "0.1"))
 
         # 清空旧的 dark_details
         _clear_directory_except(DARK_DETAILS_DIR, [])
@@ -588,7 +588,7 @@ def _clear_directory_except(directory: str, keep_files: List[str]):
 
 def _save_processed_image(masked_image: np.ndarray, image_id: str, x: int, y: int) -> str:
     # 每次生成新处理图前，先清空旧的 processed 内容
-    _clear_processed_dir()
+    # _clear_processed_dir()
 
     filename = f"{image_id}_{x}_{y}.png"
     save_path = os.path.join(PROCESSED_DIR, filename)
