@@ -127,6 +127,10 @@ async def upload_original_file(file: UploadFile = File(...)):
     # 只保留本次上传的 filename
     _clear_directory_except(ORIGINAL_DIR, [filename])
 
+    # --- 清理旧的色相掩码（color_masks）---
+    # 每次上传新图，先清空 static/color_masks 目录，避免遗留上一次的掩码文件
+    _clear_directory_except(COLOR_MASKS_DIR, [])
+
     # 读取图片以供后续处理 (OpenCV BGR -> RGB)
     img_bgr = cv2.imread(save_path)
     if img_bgr is None:
@@ -289,6 +293,8 @@ async def upload_original_file(file: UploadFile = File(...)):
     # --- 生成按色相均值着色的掩码图（放在color_masks中）---
     try:
         if 'masks' in locals() and isinstance(masks, list) and len(masks) > 0:
+            # 本次生成的掩码文件列表，用于清理目录中旧文件
+            color_mask_files = []
             # 可通过环境变量调整明度缩放，默认更深 60%（V *= 0.6）
             value_scale = float(os.environ.get("HUE_MASK_VALUE_SCALE", "0.8"))
             value_scale = max(0.0, min(1.0, value_scale))
@@ -336,6 +342,10 @@ async def upload_original_file(file: UploadFile = File(...)):
                 colored_mask_img = cv2.bitwise_and(bgr_solid, bgr_solid, mask=mask)
                 mask_fname = f"{i}.png"
                 cv2.imwrite(os.path.join(COLOR_MASKS_DIR, mask_fname), colored_mask_img)
+                color_mask_files.append(mask_fname)
+
+            # 清理目录中非本次生成的掩码文件
+            _clear_directory_except(COLOR_MASKS_DIR, color_mask_files)
     except Exception as e:
         # 不影响主流程
         print(f"generate hue mean-color masks failed: {e}")
