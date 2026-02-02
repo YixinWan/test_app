@@ -93,7 +93,7 @@ def suggest_mix(target_rgb, palette_source, paint_colors=None, max_candidates=6)
     rng = np.random.default_rng(42)
 
     # 多色线性混合（CMY 空间）
-    for n in range(2, 5):
+    for n in range(2, 4):
         for comb in itertools.combinations(candidate_colors, n):
             palette_cmy = np.array([rgb_to_cmy(c[1]) for c in comb])
 
@@ -126,7 +126,7 @@ def suggest_mix(target_rgb, palette_source, paint_colors=None, max_candidates=6)
     if best_colors is None or best_weights is None:
         return [(sorted_items[0][0], sorted_items[0][1])], np.array([1.0])
 
-    filtered = [(c, w) for c, w in zip(best_colors, best_weights) if w > 0.01]
+    filtered = [(c, w) for c, w in zip(best_colors, best_weights) if w > 0.1]
     if filtered:
         top_colors, weights = zip(*filtered)
         return list(top_colors), np.array(weights)
