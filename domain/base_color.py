@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import cv2
 from typing import Tuple, List, Dict, Optional
@@ -291,9 +292,85 @@ def segment_hue_masks(
     return masks, blocks
 
 
+def generate_hue_mean_colored_masks(
+    img_rgb: np.ndarray,
+    masks: List[np.ndarray],
+    output_dir: str,
+    *,
+    value_scale: float = 0.8,
+) -> List[str]:
+    """
+    根据每个二值掩码在原图中的像素，计算圆形均值色相与均值饱和度/明度（V 乘以可调缩放），
+    生成对应的纯色着色掩码图，并保存到 output_dir 下，文件名为 "{index}.png"。
+
+    输入:
+        img_rgb: 原图 RGB(np.uint8)
+        masks: 掩码列表，每个为 uint8 二值(0/255)
+        output_dir: 输出目录
+        value_scale: 明度缩放系数 [0,1]
+
+    返回:
+        本次生成的文件名列表（相对于 output_dir 的文件名，如 ["0.png", "1.png", ...]）
+    """
+    if img_rgb is None or len(masks) == 0:
+        return []
+
+    os.makedirs(output_dir, exist_ok=True)
+    value_scale = float(max(0.0, min(1.0, value_scale)))
+
+    # 预先计算 HSV（基于 RGB 原图）
+    hsv_img = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
+    h_cv = hsv_img[..., 0].astype(np.float32) * 2.0  # 0-360°
+    s_cv = hsv_img[..., 1].astype(np.float32) / 255.0
+    v_cv = hsv_img[..., 2].astype(np.float32) / 255.0
+
+    H, W = hsv_img.shape[:2]
+    color_mask_files: List[str] = []
+    for i, mask in enumerate(masks):
+        if mask is None:
+            continue
+        m = mask > 0
+        if not np.any(m):
+            continue
+
+        # 圆形均值色相
+        h_vals = h_cv[m]
+        ang = np.deg2rad(h_vals)
+        mean_sin = float(np.mean(np.sin(ang)))
+        mean_cos = float(np.mean(np.cos(ang)))
+        mean_angle = np.arctan2(mean_sin, mean_cos)
+        if mean_angle < 0:
+            mean_angle += 2.0 * np.pi
+        mean_h_deg = float(np.rad2deg(mean_angle))  # 0-360
+
+        # 饱和度与明度的均值，明度按系数缩放
+        mean_s = float(np.mean(s_cv[m])) if np.any(m) else 1.0
+        mean_v = float(np.mean(v_cv[m])) if np.any(m) else 1.0
+        adj_v = max(0.0, min(1.0, mean_v * value_scale))
+
+        # 构造整幅纯色图（HSV->BGR），再按掩码裁剪
+        h_val_cv = np.uint8(np.round(mean_h_deg / 2.0))  # 0-180
+        s_val_cv = np.uint8(np.round(mean_s * 255.0))
+        v_val_cv = np.uint8(np.round(adj_v * 255.0))
+
+        hsv_solid = np.zeros((H, W, 3), dtype=np.uint8)
+        hsv_solid[..., 0] = h_val_cv
+        hsv_solid[..., 1] = s_val_cv
+        hsv_solid[..., 2] = v_val_cv
+        bgr_solid = cv2.cvtColor(hsv_solid, cv2.COLOR_HSV2BGR)
+
+        colored_mask_img = cv2.bitwise_and(bgr_solid, bgr_solid, mask=mask)
+        mask_fname = f"{i}.png"
+        cv2.imwrite(os.path.join(output_dir, mask_fname), colored_mask_img)
+        color_mask_files.append(mask_fname)
+
+    return color_mask_files
+
+
 # 模块导出（便于在 app.py 中调用）
 __all__ = [
     "detect_hue_blocks",
     "segment_hue_masks",
     "clean_mask",
+    "generate_hue_mean_colored_masks",
 ]

@@ -16,7 +16,7 @@ import pickle
 from skimage.segmentation import find_boundaries
 
 from domain import suggest_mix, generate_steps_from_mix # 依赖domain/__init__.py 显式导出
-from domain import segment_hue_masks
+from domain import segment_hue_masks, generate_hue_mean_colored_masks
 from domain.line_art import line_art
 from domain.light import process_light_color_blocks_directory
 from domain.dark import process_dark_color_blocks_directory
@@ -184,6 +184,21 @@ async def upload_original_file(file: UploadFile = File(...)):
             for f in color_block_files
         ]
 
+        # --- 生成按色相均值着色的掩码图（color_masks）---
+        color_mask_files = []
+        try:
+            if isinstance(masks, list) and len(masks) > 0:
+                value_scale = float(os.environ.get("HUE_MASK_VALUE_SCALE", "0.8"))
+                color_mask_files = generate_hue_mean_colored_masks(
+                    img_rgb=img_rgb,
+                    masks=masks,
+                    output_dir=COLOR_MASKS_DIR,
+                    value_scale=value_scale,
+                )
+        except Exception as e:
+            # 不影响主流程
+            print(f"generate hue mean-color masks failed: {e}")
+
     # --- light_details 亮部细节---
         # 可通过环境变量调整阈值（便于细节处理）：LIGHT_V_PERCENTILE / LIGHT_S_PERCENTILE
         v_thr = float(os.environ.get("LIGHT_V_PERCENTILE", "0.80"))
@@ -280,6 +295,7 @@ async def upload_original_file(file: UploadFile = File(...)):
         light_urls = []
         dark_detail_urls = []
         dark_urls = []
+        color_mask_files = []
 
     # --- 清理旧的派生数据 ---
     # 保留线稿与本次生成的 color_blocks，清理多余文件
@@ -289,66 +305,8 @@ async def upload_original_file(file: UploadFile = File(...)):
     _clear_directory_except(LIGHT_DIR, [os.path.basename(url.split('/static/')[-1]) for url in light_urls])
     _clear_directory_except(DARK_DETAILS_DIR, [os.path.basename(url.split('/static/')[-1]) for url in dark_detail_urls])
     _clear_directory_except(DARK_DIR, [os.path.basename(url.split('/static/')[-1]) for url in dark_urls])
+    _clear_directory_except(COLOR_MASKS_DIR, color_mask_files)
 
-    # --- 生成按色相均值着色的掩码图（放在color_masks中）---
-    try:
-        if 'masks' in locals() and isinstance(masks, list) and len(masks) > 0:
-            # 本次生成的掩码文件列表，用于清理目录中旧文件
-            color_mask_files = []
-            # 可通过环境变量调整明度缩放，默认更深 60%（V *= 0.6）
-            value_scale = float(os.environ.get("HUE_MASK_VALUE_SCALE", "0.8"))
-            value_scale = max(0.0, min(1.0, value_scale))
-
-            # 计算一次 HSV（基于 RGB 原图）
-            hsv_img = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
-            h_cv = hsv_img[..., 0].astype(np.float32) * 2.0      # 0-360°
-            s_cv = hsv_img[..., 1].astype(np.float32) / 255.0     # 0-1
-            v_cv = hsv_img[..., 2].astype(np.float32) / 255.0     # 0-1
-
-            H, W = hsv_img.shape[:2]
-            for i, mask in enumerate(masks):
-                if mask is None:
-                    continue
-                m = mask > 0
-                if not np.any(m):
-                    continue
-
-                # 圆形均值色相（避免 0/360 度断点影响）
-                h_vals = h_cv[m]
-                ang = np.deg2rad(h_vals)
-                mean_sin = float(np.mean(np.sin(ang)))
-                mean_cos = float(np.mean(np.cos(ang)))
-                mean_angle = np.arctan2(mean_sin, mean_cos)
-                if mean_angle < 0:
-                    mean_angle += 2.0 * np.pi
-                mean_h_deg = float(np.rad2deg(mean_angle))  # 0-360
-
-                # 饱和度/明度使用该块的均值，明度再乘以可调缩放使更深
-                mean_s = float(np.mean(s_cv[m])) if np.any(m) else 1.0
-                mean_v = float(np.mean(v_cv[m])) if np.any(m) else 1.0
-                adj_v = max(0.0, min(1.0, mean_v * value_scale))
-
-                # 构造整幅纯色图（HSV -> BGR），再用二值掩码裁剪
-                h_val_cv = np.uint8(np.round(mean_h_deg / 2.0))          # 0-180
-                s_val_cv = np.uint8(np.round(mean_s * 255.0))
-                v_val_cv = np.uint8(np.round(adj_v * 255.0))
-
-                hsv_solid = np.zeros((H, W, 3), dtype=np.uint8)
-                hsv_solid[..., 0] = h_val_cv
-                hsv_solid[..., 1] = s_val_cv
-                hsv_solid[..., 2] = v_val_cv
-                bgr_solid = cv2.cvtColor(hsv_solid, cv2.COLOR_HSV2BGR)
-
-                colored_mask_img = cv2.bitwise_and(bgr_solid, bgr_solid, mask=mask)
-                mask_fname = f"{i}.png"
-                cv2.imwrite(os.path.join(COLOR_MASKS_DIR, mask_fname), colored_mask_img)
-                color_mask_files.append(mask_fname)
-
-            # 清理目录中非本次生成的掩码文件
-            _clear_directory_except(COLOR_MASKS_DIR, color_mask_files)
-    except Exception as e:
-        # 不影响主流程
-        print(f"generate hue mean-color masks failed: {e}")
 
     return {
         "code": 0,
