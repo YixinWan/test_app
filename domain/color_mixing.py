@@ -126,7 +126,7 @@ def suggest_mix(target_rgb, palette_source, paint_colors=None, max_candidates=6)
     if best_colors is None or best_weights is None:
         return [(sorted_items[0][0], sorted_items[0][1])], np.array([1.0])
 
-    filtered = [(c, w) for c, w in zip(best_colors, best_weights) if w > 0.1]
+    filtered = [(c, w) for c, w in zip(best_colors, best_weights) if w > 0.05]
     if filtered:
         top_colors, weights = zip(*filtered)
         return list(top_colors), np.array(weights)
